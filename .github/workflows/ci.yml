@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-build-and-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run tests
+        run: npm test
+
+      - name: Check server syntax
+        run: node --check server.js
+
+      - name: Build production image
+        run: docker build --tag medical-billing-coding:ci .
+
+      - name: Run container health check
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id="$(docker run --detach --publish 127.0.0.1::4173 medical-billing-coding:ci)"
+          trap 'docker logs "$container_id" || true; docker rm --force "$container_id" >/dev/null 2>&1 || true' EXIT
+
+          for attempt in {1..30}; do
+            status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container_id")"
+            if [[ "$status" == "healthy" ]]; then
+              exit 0
+            fi
+            if [[ "$status" == "unhealthy" ]]; then
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Container did not become healthy before the timeout" >&2
+          exit 1
+
+      - name: Scan tracked files for secrets and patient documents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t tracked < <(git ls-files)
+          forbidden_files=()
+          for path in "${tracked[@]}"; do
+            lower="${path,,}"
+            case "$lower" in
+              .env|.env.*)
+                [[ "$lower" == ".env.example" ]] || forbidden_files+=("$path")
+                ;;
+              uploads/*|*/uploads/*|patient-data/*|*/patient-data/*|patient-documents/*|*/patient-documents/*|medical-documents/*|*/medical-documents/*|*.pdf|*.dcm|*.dicom|*.doc|*.docx|*.nii|*.nii.gz)
+                forbidden_files+=("$path")
+                ;;
+            esac
+          done
+
+          if ((${#forbidden_files[@]})); then
+            printf 'Forbidden tracked patient or environment file: %s\n' "${forbidden_files[@]}" >&2
+            exit 1
+          fi
+
+          secret_pattern='(sk-(proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)'
+          if git grep -IEn "$secret_pattern" -- . ':(exclude).env.example'; then
+            echo 'Potential secret found in tracked files' >&2
+            exit 1
+          fi
+
+          if git grep -IEn 'OPENAI_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]#.]+' -- . ':(exclude).env.example'; then
+            echo 'A non-placeholder OPENAI_API_KEY assignment is tracked' >&2
+            exit 1
+          fi
