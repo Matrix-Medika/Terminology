@@ -32,14 +32,14 @@ curl http://127.0.0.1:4173/api/health
 
 ## 4. Reverse proxy
 
-הפנו את `coding.matrixmedika.com` אל `127.0.0.1:4173` דרך HTTPS. מומלץ להגביל גודל בקשה ל-35MB ולהגדיר timeout של 120 שניות לעיבוד AI.
+הפנו את `coding.matrix-medika.com` אל `127.0.0.1:4173` דרך HTTPS. מומלץ להגביל גודל בקשה ל-35MB ולהגדיר timeout של 120 שניות לעיבוד AI.
 
 דוגמת Nginx:
 
 ```nginx
 server {
     listen 443 ssl http2;
-    server_name coding.matrixmedika.com;
+    server_name coding.matrix-medika.com;
 
     client_max_body_size 35m;
     proxy_read_timeout 120s;
