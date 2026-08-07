@@ -1,0 +1,36 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials*.json
+secrets*.json
+
+# Dependencies and runtime
+node_modules/
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Test / coverage / temporary files
+coverage/
+.tmp/
+tmp/
+uploads/
+patient-data/
+patient-documents/
+medical-documents/
+*.pdf
+*.PDF
+*.dcm
+*.dicom
+*.doc
+*.docx
+*.nii
+*.nii.gz

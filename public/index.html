@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#f7f8fa" />
+    <meta name="description" content="המרת מסמכים רפואיים לעובדות קליניות, טרמינולוגיה והחלטת חיוב מוסברת." />
+    <title>קוד מדויק · Clinical Intelligence</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="קוד מדויק">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+              <path d="M7 9.5A4.5 4.5 0 0 1 11.5 5h9A4.5 4.5 0 0 1 25 9.5v13a4.5 4.5 0 0 1-4.5 4.5h-9A4.5 4.5 0 0 1 7 22.5v-13Z" stroke="currentColor" stroke-width="2"/>
+              <path d="M12 12h8M12 16h8M12 20h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </div>
+          <div>
+            <div class="brand-name">קוד מדויק</div>
+            <div class="brand-subtitle">Clinical Intelligence</div>
+          </div>
+        </div>
+        <button id="newAnalysisTop" class="ghost-button hidden" type="button">ניתוח חדש</button>
+      </header>
+
+      <main>
+        <section id="intakeView" class="view view-active" aria-labelledby="intakeTitle">
+          <div class="intro">
+            <span class="eyebrow">Evidence before code</span>
+            <h1 id="intakeTitle">ניתוח מסמך רפואי</h1>
+            <p>העלאת מסמך אחת. תחילה העובדות והממצאים, לאחר מכן הקודים והחיוב.</p>
+          </div>
+
+          <div class="intake-card">
+            <div id="dropZone" class="drop-zone" tabindex="0" role="button" aria-label="בחירת מסמך רפואי">
+              <input id="fileInput" type="file" accept="application/pdf,text/plain,.pdf,.txt" hidden />
+              <div class="upload-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                  <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M5 14v4.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                </svg>
+              </div>
+              <div class="drop-content">
+                <div class="drop-title">גררי לכאן PDF או TXT</div>
+                <div class="drop-copy">או בחרי קובץ · עד 25MB</div>
+              </div>
+              <button id="chooseFile" class="secondary-button" type="button">בחירת מסמך</button>
+            </div>
+
+            <details class="paste-option">
+              <summary>הדבקת טקסט במקום קובץ</summary>
+              <label class="text-input-block" for="pastedText">
+                <span class="sr-only">טקסט רפואי</span>
+                <textarea id="pastedText" rows="7" placeholder="הדביקי כאן פענוח, סיכום אשפוז או תיאור קליני..."></textarea>
+              </label>
+            </details>
+
+            <div class="intake-footer">
+              <div class="privacy-note">
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 3 5.5 6v5.5c0 4.2 2.7 7.8 6.5 9.5 3.8-1.7 6.5-5.3 6.5-9.5V6L12 3Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                  <path d="m9.5 12 1.6 1.6 3.5-3.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>המסמך אינו נשמר לאחר רענון.</span>
+              </div>
+              <button id="analyzeText" class="primary-button" type="button">ניתוח המסמך</button>
+            </div>
+
+            <div id="intakeError" class="error-message hidden" role="alert"></div>
+          </div>
+        </section>
+
+        <section id="processingView" class="view" aria-live="polite">
+          <div class="processing-card">
+            <div class="processing-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
+            <span class="eyebrow">עיבוד קליני</span>
+            <h2 id="processingTitle">קוראים את המסמך</h2>
+            <p id="processingSubtitle">מחלצים טקסט ושומרים את הראיות המקוריות.</p>
+            <div class="progress-track"><span id="progressBar"></span></div>
+            <ol class="process-steps">
+              <li data-step="1" class="active"><span>1</span>מסמך</li>
+              <li data-step="2"><span>2</span>עובדות</li>
+              <li data-step="3"><span>3</span>קודים</li>
+              <li data-step="4"><span>4</span>חיוב</li>
+            </ol>
+          </div>
+        </section>
+
+        <section id="resultView" class="view" aria-labelledby="resultTitle">
+          <div class="result-header">
+            <div>
+              <span class="eyebrow">תוצאת ניתוח</span>
+              <h1 id="resultTitle">סיכום קליני מובנה</h1>
+              <p id="resultSubtitle">העובדות מוצגות לפני הקודים.</p>
+            </div>
+            <div class="result-actions">
+              <button id="maskToggle" class="secondary-button" type="button">הסתרת מזהים</button>
+              <button id="reanalyze" class="secondary-button" type="button">ניתוח מחדש</button>
+            </div>
+          </div>
+
+          <div id="summaryBanner" class="summary-banner">
+            <div class="summary-main">
+              <div id="summaryIcon" class="summary-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                  <path d="m7 12 3 3 7-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/>
+                </svg>
+              </div>
+              <div>
+                <div id="summaryTitle" class="summary-title">—</div>
+                <div id="summaryMeta" class="summary-meta">—</div>
+              </div>
+            </div>
+            <div class="confidence-block"><span>איכות חילוץ</span><strong id="confidenceValue">—</strong></div>
+          </div>
+
+          <nav class="result-flow" aria-label="שלבי התוצאה">
+            <a href="#factsSection">עובדות</a><span>›</span>
+            <a href="#findingsSection">ממצאים</a><span>›</span>
+            <a href="#terminologySection">קודים</a><span>›</span>
+            <a href="#billingSection">חיוב</a>
+          </nav>
+
+          <section id="factsSection" class="content-section" aria-labelledby="factsHeading">
+            <div class="section-heading">
+              <div><span class="section-kicker">01</span><h2 id="factsHeading">עובדות קליניות</h2></div>
+              <button class="link-button" data-open-source="all" type="button">פתיחת המקור</button>
+            </div>
+            <div id="factsGrid" class="facts-grid"></div>
+          </section>
+
+          <section id="findingsSection" class="content-section" aria-labelledby="findingsHeading">
+            <div class="section-heading">
+              <div><span class="section-kicker">02</span><h2 id="findingsHeading">ממצאים</h2></div>
+              <span id="findingsCount" class="count-badge">0</span>
+            </div>
+            <div id="findingsList" class="findings-list"></div>
+          </section>
+
+          <section id="terminologySection" class="content-section" aria-labelledby="terminologyHeading">
+            <div class="section-heading">
+              <div><span class="section-kicker">03</span><h2 id="terminologyHeading">קודים לפרוצדורה</h2></div>
+              <span class="subtle-text">לאחר פתרון העובדות</span>
+            </div>
+            <div class="code-table-head" aria-hidden="true"><span>מערכת</span><span>קוד</span><span>תיאור</span><span>סטטוס</span></div>
+            <div id="procedureCodes" class="code-grid"></div>
+
+            <details class="advanced-details">
+              <summary>קודים אפשריים לממצאים</summary>
+              <div id="findingCodes" class="finding-codes"></div>
+            </details>
+          </section>
+
+          <section id="billingSection" class="content-section billing-section" aria-labelledby="billingHeading">
+            <div class="section-heading">
+              <div><span class="section-kicker">04</span><h2 id="billingHeading">החלטת חיוב</h2></div>
+              <span id="billingStatusBadge" class="status-badge">—</span>
+            </div>
+            <div id="billingCard" class="billing-card"></div>
+          </section>
+
+          <details class="advanced-details system-details">
+            <summary>אי־ודאויות ופרטים טכניים</summary>
+            <div id="technicalDetails" class="technical-details"></div>
+          </details>
+
+          <div class="sticky-action-bar">
+            <button id="newAnalysisBottom" class="secondary-button" type="button">מסמך חדש</button>
+            <button id="approveResult" class="primary-button" type="button">אישור לבדיקה אנושית</button>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="sourceDrawer" class="drawer-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="sourceTitle">
+      <aside class="source-drawer">
+        <div class="drawer-header">
+          <div><span class="eyebrow">ראיה מהמקור</span><h2 id="sourceTitle">המסמך המקורי</h2></div>
+          <button id="closeDrawer" class="icon-button" type="button" aria-label="סגירה">×</button>
+        </div>
+        <div id="sourceEvidence" class="source-evidence"></div>
+        <pre id="sourceText" class="source-text"></pre>
+      </aside>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
