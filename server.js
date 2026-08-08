@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
+import { performance } from 'node:perf_hooks';
 
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 4173);
@@ -14,6 +15,221 @@ const HOST = process.env.HOST || '0.0.0.0';
 const APP_VERSION = process.env.APP_VERSION || '1.1.0';
 const PUBLIC_DIR = join(process.cwd(), 'public');
 const MAX_BODY_BYTES = 35 * 1024 * 1024;
+
+function isDebuggingMode(env = process.env) {
+  return /^(1|true|yes|on)$/i.test(String(env.DEBUGGING_MODE || '').trim());
+}
+
+function createTelemetry({ enabled = isDebuggingMode(), requestId = randomUUID() } = {}) {
+  const startedAt = performance.now();
+  const stages = {};
+  const stageCounts = {};
+  const aiCalls = [];
+  const context = {};
+  const round = (value) => Math.round(Number(value) * 100) / 100;
+
+  const recordStage = (name, durationMs) => {
+    if (!enabled) return;
+    stages[name] = round((stages[name] || 0) + Number(durationMs || 0));
+    stageCounts[name] = (stageCounts[name] || 0) + 1;
+  };
+
+  return {
+    enabled,
+    requestId,
+    async measure(name, operation) {
+      if (!enabled) return await operation();
+      const start = performance.now();
+      try {
+        return await operation();
+      } finally {
+        recordStage(name, performance.now() - start);
+      }
+    },
+    recordStage,
+    recordAi(call) {
+      if (!enabled) return;
+      aiCalls.push({
+        provider: call.provider,
+        purpose: call.purpose,
+        wallMs: round(call.wallMs),
+        providerLatencyMs: Number.isFinite(Number(call.providerLatencyMs)) ? round(call.providerLatencyMs) : null,
+        inputTokens: Number.isFinite(Number(call.inputTokens)) ? Number(call.inputTokens) : null,
+        outputTokens: Number.isFinite(Number(call.outputTokens)) ? Number(call.outputTokens) : null,
+        status: call.status,
+        serviceTier: call.serviceTier || null,
+        stopReason: call.stopReason || null,
+      });
+    },
+    setContext(values) {
+      if (!enabled) return;
+      Object.assign(context, values);
+    },
+    snapshot(outcome = 'success') {
+      if (!enabled) return null;
+      return {
+        requestId,
+        outcome,
+        totalMs: round(performance.now() - startedAt),
+        stages: { ...stages },
+        stageCounts: { ...stageCounts },
+        aiCalls: [...aiCalls],
+        context: { ...context },
+      };
+    },
+    serverTiming() {
+      if (!enabled) return null;
+      const entries = Object.entries(stages).map(([name, duration]) => `${name};dur=${round(duration)}`);
+      entries.push(`total;dur=${round(performance.now() - startedAt)}`);
+      return entries.join(', ');
+    },
+  };
+}
+
+function logTelemetry(telemetry, outcome) {
+  const snapshot = telemetry.snapshot(outcome);
+  if (snapshot) console.info(JSON.stringify({ event: 'analysis_telemetry', ...snapshot }));
+}
+
+function getAiConfig() {
+  const bedrockToken = process.env.AWS_BEARER_TOKEN_BEDROCK;
+  if (bedrockToken) {
+    const region = process.env.AWS_REGION || 'us-east-1';
+    const model = process.env.BEDROCK_MODEL_ID;
+    if (!model) throw new Error('BEDROCK_MODEL_ID אינו מוגדר');
+    return {
+      provider: 'bedrock',
+      token: bedrockToken,
+      model,
+      baseUrl: (process.env.BEDROCK_BASE_URL || `https://bedrock-runtime.${region}.amazonaws.com`).replace(/\/$/, ''),
+      serviceTier: process.env.BEDROCK_SERVICE_TIER || null,
+    };
+  }
+
+  const openAiKey = process.env.OPENAI_API_KEY;
+  if (openAiKey) {
+    return {
+      provider: 'openai',
+      token: openAiKey,
+      model: process.env.OPENAI_MODEL || 'gpt-5.6',
+    };
+  }
+
+  return null;
+}
+
+function bedrockConverseUrl(config) {
+  return `${config.baseUrl}/model/${encodeURIComponent(config.model)}/converse`;
+}
+
+function buildBedrockRequest(prompt, documentBase64 = null) {
+  const content = [{ text: prompt }];
+  if (documentBase64) {
+    content.push({
+      document: {
+        format: 'pdf',
+        name: 'medical-document',
+        source: { bytes: documentBase64 },
+      },
+    });
+  }
+  return {
+    messages: [{ role: 'user', content }],
+    inferenceConfig: { maxTokens: documentBase64 ? 12000 : 6000 },
+  };
+}
+
+async function requestAiText(prompt, documentBase64 = null, telemetry = null, purpose = 'analysis') {
+  const config = getAiConfig();
+  if (!config) throw new Error('ספק AI אינו מוגדר');
+  const requestStartedAt = performance.now();
+
+  if (config.provider === 'bedrock') {
+    const headers = {
+      Authorization: `Bearer ${config.token}`,
+      'Content-Type': 'application/json',
+    };
+    if (config.serviceTier) headers['X-Amzn-Bedrock-Service-Tier'] = config.serviceTier;
+
+    let response;
+    let payload;
+    try {
+      response = await fetch(bedrockConverseUrl(config), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(buildBedrockRequest(prompt, documentBase64)),
+      });
+      if (!response.ok) throw new Error(`Bedrock ${response.status}`);
+      payload = await response.json();
+      const outputText = payload.output?.message?.content
+        ?.filter((item) => typeof item.text === 'string')
+        .map((item) => item.text)
+        .join('\n');
+      if (!outputText) throw new Error('Bedrock החזיר תשובה ריקה');
+      telemetry?.recordAi({
+        provider: 'bedrock',
+        purpose,
+        wallMs: performance.now() - requestStartedAt,
+        providerLatencyMs: payload.metrics?.latencyMs,
+        inputTokens: payload.usage?.inputTokens,
+        outputTokens: payload.usage?.outputTokens,
+        status: response.status,
+        serviceTier: payload.serviceTier?.type || payload.serviceTier || null,
+        stopReason: payload.stopReason,
+      });
+      return outputText;
+    } catch (error) {
+      telemetry?.recordAi({ provider: 'bedrock', purpose, wallMs: performance.now() - requestStartedAt, status: response?.status || 'network_error' });
+      throw error;
+    }
+  }
+
+  const content = documentBase64
+    ? [
+        { type: 'input_text', text: prompt },
+        {
+          type: 'input_file',
+          filename: 'medical-document.pdf',
+          file_data: `data:application/pdf;base64,${documentBase64}`,
+        },
+      ]
+    : null;
+  let response;
+  let payload;
+  try {
+    response = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: config.model,
+        store: false,
+        input: content ? [{ role: 'user', content }] : prompt,
+      }),
+    });
+    if (!response.ok) throw new Error(`OpenAI ${response.status}`);
+    payload = await response.json();
+    const outputText = payload.output_text
+      || payload.output?.flatMap((item) => item.content || []).find((item) => item.type === 'output_text')?.text;
+    if (!outputText) throw new Error('OpenAI החזיר תשובה ריקה');
+    telemetry?.recordAi({
+      provider: 'openai',
+      purpose,
+      wallMs: performance.now() - requestStartedAt,
+      inputTokens: payload.usage?.input_tokens,
+      outputTokens: payload.usage?.output_tokens,
+      status: response.status,
+      serviceTier: payload.service_tier || null,
+      stopReason: payload.incomplete_details?.reason || payload.status || null,
+    });
+    return outputText;
+  } catch (error) {
+    telemetry?.recordAi({ provider: 'openai', purpose, wallMs: performance.now() - requestStartedAt, status: response?.status || 'network_error' });
+    throw error;
+  }
+}
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -354,9 +570,9 @@ function calculateConfidence({ patient, procedure, document, findings, terminolo
   return Math.round((score / weight) * 100);
 }
 
-async function aiEnhance(text, baseAnalysis) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return { ...baseAnalysis, extractionProvider: 'local-evidence-parser' };
+async function aiEnhance(text, baseAnalysis, telemetry = null) {
+  const aiConfig = getAiConfig();
+  if (!aiConfig) return { ...baseAnalysis, extractionProvider: 'local-evidence-parser' };
 
   const prompt = `
 You are extracting structured facts from a Hebrew medical document.
@@ -381,25 +597,12 @@ DOCUMENT:
 `;
 
   try {
-    const response = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || 'gpt-5.6',
-        input: prompt,
-        store: false,
-      }),
-    });
-
-    if (!response.ok) throw new Error(`OpenAI ${response.status}`);
-    const payload = await response.json();
-    const outputText = payload.output_text || payload.output?.flatMap((item) => item.content || []).find((item) => item.type === 'output_text')?.text;
-    if (!outputText) throw new Error('Empty model output');
-    const cleaned = outputText.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
-    const ai = JSON.parse(cleaned);
+    const outputText = await telemetry?.measure('ai_enhancement', () => requestAiText(prompt, null, telemetry, 'clinical_enhancement'))
+      ?? await requestAiText(prompt, null, telemetry, 'clinical_enhancement');
+    const ai = await telemetry?.measure('ai_json_parse', () => {
+      const cleaned = outputText.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+      return JSON.parse(cleaned);
+    }) ?? JSON.parse(outputText.replace(/^```json\s*/i, '').replace(/```$/i, '').trim());
 
     const merge = {
       ...baseAnalysis,
@@ -439,7 +642,7 @@ DOCUMENT:
           })),
       ],
       warnings: [...new Set([...(baseAnalysis.warnings || []), ...(ai.warnings || [])])],
-      extractionProvider: 'openai-assisted',
+      extractionProvider: `${aiConfig.provider}-assisted`,
     };
 
     const updatedTerminology = procedureTerminology(merge.procedure);
@@ -502,51 +705,25 @@ function buildLocalAnalysis(text, filename) {
 }
 
 
-async function extractPdfTextWithAI(buffer, filename) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('לא נמצאה שכבת טקסט וה-OCR בענן אינו מוגדר');
-
-  const response = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || 'gpt-5.6',
-      store: false,
-      input: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'input_text',
-              text: 'Transcribe this medical PDF faithfully. Preserve Hebrew, English, numbers, section breaks and negations. Return only the document text. Do not interpret or summarize.',
-            },
-            {
-              type: 'input_file',
-              filename: filename || 'document.pdf',
-              file_data: `data:application/pdf;base64,${buffer.toString('base64')}`,
-            },
-          ],
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) throw new Error(`OCR בענן נכשל (${response.status})`);
-  const payload = await response.json();
-  const outputText = payload.output_text || payload.output?.flatMap((item) => item.content || []).find((item) => item.type === 'output_text')?.text;
+async function extractPdfTextWithAI(buffer, filename, telemetry = null) {
+  if (!getAiConfig()) throw new Error('לא נמצאה שכבת טקסט וה-OCR בענן אינו מוגדר');
+  const outputText = await requestAiText(
+    'Transcribe this medical PDF faithfully. Preserve Hebrew, English, numbers, section breaks and negations. Return only the document text. Do not interpret or summarize.',
+    buffer.toString('base64'),
+    telemetry,
+    'pdf_ocr',
+  );
   const text = cleanBidi(outputText || '');
   if (text.length < 40) throw new Error('OCR בענן לא החזיר טקסט מספק');
   return text;
 }
 
-async function extractText({ fileBase64, mimeType, filename, pastedText }) {
+async function extractText({ fileBase64, mimeType, filename, pastedText }, telemetry = null) {
   if (pastedText?.trim()) return pastedText.trim();
   if (!fileBase64) throw new Error('לא התקבל תוכן קובץ');
 
-  const buffer = Buffer.from(fileBase64, 'base64');
+  const buffer = await telemetry?.measure('base64_decode', () => Buffer.from(fileBase64, 'base64'))
+    ?? Buffer.from(fileBase64, 'base64');
   if (buffer.byteLength > 25 * 1024 * 1024) throw new Error('הקובץ גדול מ־25MB');
 
   const lowerName = String(filename || '').toLowerCase();
@@ -558,20 +735,31 @@ async function extractText({ fileBase64, mimeType, filename, pastedText }) {
 
   const tempFile = join(tmpdir(), `${randomUUID()}.pdf`);
   try {
-    await writeFile(tempFile, buffer);
+    if (telemetry) await telemetry.measure('pdf_temp_write', () => writeFile(tempFile, buffer));
+    else await writeFile(tempFile, buffer);
     try {
-      const { stdout } = await execFileAsync('pdftotext', ['-layout', tempFile, '-'], {
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 30000,
-      });
+      const runPdfToText = () => execFileAsync('pdftotext', ['-layout', tempFile, '-'], {
+          maxBuffer: 10 * 1024 * 1024,
+          timeout: 30000,
+        });
+      const { stdout } = telemetry
+        ? await telemetry.measure('pdf_text_extract', runPdfToText)
+        : await runPdfToText();
       const text = cleanBidi(stdout);
-      if (text && text.length >= 40) return text;
+      if (text && text.length >= 40) {
+        telemetry?.setContext({ pdfExtraction: 'local_text_layer' });
+        return text;
+      }
     } catch {
       // Fall through to AI OCR. The local parser remains the preferred path.
     }
-    return await extractPdfTextWithAI(buffer, filename);
+    telemetry?.setContext({ pdfExtraction: 'cloud_ocr_fallback' });
+    return telemetry
+      ? await telemetry.measure('pdf_cloud_ocr', () => extractPdfTextWithAI(buffer, filename, telemetry))
+      : await extractPdfTextWithAI(buffer, filename, telemetry);
   } finally {
-    await unlink(tempFile).catch(() => {});
+    if (telemetry) await telemetry.measure('pdf_temp_cleanup', () => unlink(tempFile).catch(() => {}));
+    else await unlink(tempFile).catch(() => {});
   }
 }
 
@@ -597,28 +785,50 @@ function securityHeaders() {
   };
 }
 
-function sendJson(res, statusCode, payload) {
+function sendJson(res, statusCode, payload, extraHeaders = {}) {
   res.writeHead(statusCode, {
     ...securityHeaders(),
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
+    ...extraHeaders,
   });
   res.end(JSON.stringify(payload));
 }
 
 async function handleAnalyze(req, res) {
+  const telemetry = createTelemetry();
   try {
-    const payload = await readJsonBody(req);
-    const text = await extractText(payload);
-    const base = buildLocalAnalysis(text, payload.filename || 'מסמך ללא שם');
-    const analysis = await aiEnhance(text, base);
-    sendJson(res, 200, { ok: true, analysis });
+    const payload = await telemetry.measure('request_body_parse', () => readJsonBody(req));
+    const inputKind = payload.pastedText?.trim()
+      ? 'pasted_text'
+      : (payload.mimeType === 'application/pdf' || String(payload.filename || '').toLowerCase().endsWith('.pdf'))
+        ? 'pdf'
+        : 'text_file';
+    telemetry.setContext({
+      inputKind,
+      inputBytes: payload.fileBase64 ? Math.round(payload.fileBase64.length * 0.75) : Buffer.byteLength(payload.pastedText || '', 'utf8'),
+    });
+    const text = await telemetry.measure('text_extraction_total', () => extractText(payload, telemetry));
+    telemetry.setContext({ extractedCharacters: text.length });
+    const base = await telemetry.measure('local_analysis', () => buildLocalAnalysis(text, payload.filename || 'מסמך ללא שם'));
+    const analysis = await telemetry.measure('ai_enhance_total', () => aiEnhance(text, base, telemetry));
+    const debugTelemetry = telemetry.snapshot('success');
+    const responsePayload = { ok: true, analysis };
+    if (debugTelemetry) responsePayload.debugTelemetry = debugTelemetry;
+    const serverTiming = telemetry.serverTiming();
+    sendJson(res, 200, responsePayload, serverTiming ? { 'Server-Timing': serverTiming, 'X-Debug-Request-Id': telemetry.requestId } : {});
+    logTelemetry(telemetry, 'success');
   } catch (error) {
-    sendJson(res, 422, {
+    const responsePayload = {
       ok: false,
       error: error.message || 'המסמך לא עובד',
       guidance: 'נסי PDF אחר, קובץ TXT או הדבקת טקסט. המערכת אינה מחליפה תוצאה במסמך דמו.',
-    });
+    };
+    const debugTelemetry = telemetry.snapshot('error');
+    if (debugTelemetry) responsePayload.debugTelemetry = debugTelemetry;
+    const serverTiming = telemetry.serverTiming();
+    sendJson(res, 422, responsePayload, serverTiming ? { 'Server-Timing': serverTiming, 'X-Debug-Request-Id': telemetry.requestId } : {});
+    logTelemetry(telemetry, 'error');
   }
 }
 
@@ -662,7 +872,9 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 200, {
       status: 'ok',
       version: APP_VERSION,
-      aiConfigured: Boolean(process.env.OPENAI_API_KEY),
+      aiConfigured: Boolean(process.env.AWS_BEARER_TOKEN_BEDROCK || process.env.OPENAI_API_KEY),
+      aiProvider: process.env.AWS_BEARER_TOKEN_BEDROCK ? 'bedrock' : (process.env.OPENAI_API_KEY ? 'openai' : 'none'),
+      debuggingMode: isDebuggingMode(),
       persistence: 'none',
     });
     return;
@@ -692,4 +904,9 @@ export {
   detectFindings,
   procedureTerminology,
   buildLocalAnalysis,
+  getAiConfig,
+  bedrockConverseUrl,
+  buildBedrockRequest,
+  isDebuggingMode,
+  createTelemetry,
 };

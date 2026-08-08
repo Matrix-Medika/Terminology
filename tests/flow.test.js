@@ -6,6 +6,11 @@ import {
   detectProcedure,
   detectFindings,
   buildLocalAnalysis,
+  getAiConfig,
+  bedrockConverseUrl,
+  buildBedrockRequest,
+  isDebuggingMode,
+  createTelemetry,
 } from '../server.js';
 
 const sample = `
@@ -94,4 +99,82 @@ test('result UI follows facts → findings → codes → billing and has no side
 test('advanced mappings and technical details are collapsed by default', async () => {
   const html = await (await import('node:fs/promises')).readFile(new URL('../public/index.html', import.meta.url), 'utf8');
   assert.equal(/<details[^>]*\sopen(?:\s|>)/i.test(html), false);
+});
+
+test('builds a Bedrock Runtime Converse request without exposing the source filename', () => {
+  const request = buildBedrockRequest('Transcribe faithfully', 'cGRm');
+  assert.deepEqual(request.messages[0].content[0], { text: 'Transcribe faithfully' });
+  assert.deepEqual(request.messages[0].content[1], {
+    document: {
+      format: 'pdf',
+      name: 'medical-document',
+      source: { bytes: 'cGRm' },
+    },
+  });
+  assert.deepEqual(request.inferenceConfig, { maxTokens: 12000 });
+});
+
+test('uses the regional Bedrock Runtime endpoint and bearer-token configuration', () => {
+  const previous = {
+    token: process.env.AWS_BEARER_TOKEN_BEDROCK,
+    region: process.env.AWS_REGION,
+    model: process.env.BEDROCK_MODEL_ID,
+    baseUrl: process.env.BEDROCK_BASE_URL,
+  };
+  try {
+    process.env.AWS_BEARER_TOKEN_BEDROCK = 'test-token';
+    process.env.AWS_REGION = 'us-east-1';
+    process.env.BEDROCK_MODEL_ID = 'us.anthropic.claude-opus-5';
+    delete process.env.BEDROCK_BASE_URL;
+    const config = getAiConfig();
+    assert.equal(config.provider, 'bedrock');
+    assert.equal(config.token, 'test-token');
+    assert.equal(
+      bedrockConverseUrl(config),
+      'https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-opus-5/converse',
+    );
+  } finally {
+    if (previous.token === undefined) delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+    else process.env.AWS_BEARER_TOKEN_BEDROCK = previous.token;
+    if (previous.region === undefined) delete process.env.AWS_REGION;
+    else process.env.AWS_REGION = previous.region;
+    if (previous.model === undefined) delete process.env.BEDROCK_MODEL_ID;
+    else process.env.BEDROCK_MODEL_ID = previous.model;
+    if (previous.baseUrl === undefined) delete process.env.BEDROCK_BASE_URL;
+    else process.env.BEDROCK_BASE_URL = previous.baseUrl;
+  }
+});
+
+test('debugging mode is explicit and defaults to disabled', () => {
+  assert.equal(isDebuggingMode({}), false);
+  assert.equal(isDebuggingMode({ DEBUGGING_MODE: 'false' }), false);
+  assert.equal(isDebuggingMode({ DEBUGGING_MODE: 'true' }), true);
+  assert.equal(isDebuggingMode({ DEBUGGING_MODE: '1' }), true);
+});
+
+test('telemetry emits timings only when debugging mode is enabled', async () => {
+  const disabled = createTelemetry({ enabled: false, requestId: 'disabled-request' });
+  await disabled.measure('local_analysis', () => Promise.resolve('ok'));
+  assert.equal(disabled.snapshot(), null);
+  assert.equal(disabled.serverTiming(), null);
+
+  const enabled = createTelemetry({ enabled: true, requestId: 'debug-request' });
+  await enabled.measure('local_analysis', () => Promise.resolve('ok'));
+  enabled.recordAi({
+    provider: 'bedrock',
+    purpose: 'clinical_enhancement',
+    wallMs: 15,
+    providerLatencyMs: 12,
+    inputTokens: 100,
+    outputTokens: 25,
+    status: 200,
+  });
+  enabled.setContext({ inputKind: 'pasted_text', inputBytes: 120 });
+  const snapshot = enabled.snapshot();
+  assert.equal(snapshot.requestId, 'debug-request');
+  assert.equal(snapshot.aiCalls.length, 1);
+  assert.equal(snapshot.aiCalls[0].provider, 'bedrock');
+  assert.equal(snapshot.context.inputKind, 'pasted_text');
+  assert.ok(snapshot.stages.local_analysis >= 0);
+  assert.match(enabled.serverTiming(), /local_analysis;dur=/);
 });
