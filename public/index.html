@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#f7f8fa" />
     <meta name="description" content="המרת מסמכים רפואיים לעובדות קליניות, טרמינולוגיה והחלטת חיוב מוסברת." />
     <title>קוד מדויק · Clinical Intelligence</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=2" />
   </head>
   <body>
     <div class="app-shell">
@@ -125,13 +125,16 @@
             <a href="#billingSection">חיוב</a>
           </nav>
 
-          <section id="factsSection" class="content-section" aria-labelledby="factsHeading">
+          <details id="factsSection" class="content-section facts-compact" aria-labelledby="factsHeading">
+            <summary>
             <div class="section-heading">
               <div><span class="section-kicker">01</span><h2 id="factsHeading">עובדות קליניות</h2></div>
-              <button class="link-button" data-open-source="all" type="button">פתיחת המקור</button>
+              <span class="subtle-text">תמצית לקבלת החלטה · לחצי להרחבה</span>
             </div>
+            <div id="factsHighlights" class="facts-highlights"></div>
+            </summary>
             <div id="factsGrid" class="facts-grid"></div>
-          </section>
+          </details>
 
           <section id="findingsSection" class="content-section" aria-labelledby="findingsHeading">
             <div class="section-heading">
@@ -141,18 +144,23 @@
             <div id="findingsList" class="findings-list"></div>
           </section>
 
-          <section id="terminologySection" class="content-section" aria-labelledby="terminologyHeading">
+          <section id="terminologySection" class="content-section coding-workspace" aria-labelledby="terminologyHeading">
             <div class="section-heading">
-              <div><span class="section-kicker">03</span><h2 id="terminologyHeading">קודים לפרוצדורה</h2></div>
-              <span class="subtle-text">לאחר פתרון העובדות</span>
+              <div><span class="section-kicker">03</span><h2 id="terminologyHeading">בחירת קודים</h2></div>
+              <span id="recalculationStatus" class="live-status">מתעדכן לפי הבחירה</span>
             </div>
-            <div class="code-table-head" aria-hidden="true"><span>מערכת</span><span>קוד</span><span>תיאור</span><span>סטטוס</span></div>
-            <div id="procedureCodes" class="code-grid"></div>
-
-            <details class="advanced-details">
-              <summary>קודים אפשריים לממצאים</summary>
-              <div id="findingCodes" class="finding-codes"></div>
-            </details>
+            <p class="workspace-help">הסימון כולל או מוציא פריט מהחישוב. לחיצה על הקוד מאפשרת להחליף אותו בחלופה.</p>
+            <div class="coding-columns">
+              <section class="selection-panel" aria-labelledby="diagnosisHeading">
+                <div class="selection-panel-head"><h3 id="diagnosisHeading">אבחנות</h3><span id="diagnosisCount" class="count-badge">0 נבחרו</span></div>
+                <div id="diagnosisCodes" class="selection-list"></div>
+              </section>
+              <section class="selection-panel" aria-labelledby="procedureHeading">
+                <div class="selection-panel-head"><h3 id="procedureHeading">פרוצדורות</h3><span id="procedureCount" class="count-badge">0 נבחרו</span></div>
+                <div id="procedureCodes" class="selection-list"></div>
+              </section>
+            </div>
+            <div id="alternativePopover" class="alternative-popover hidden" role="dialog" aria-modal="false" aria-labelledby="alternativeTitle"></div>
           </section>
 
           <section id="billingSection" class="content-section billing-section" aria-labelledby="billingHeading">
@@ -168,9 +176,14 @@
             <div id="technicalDetails" class="technical-details"></div>
           </details>
 
-          <div class="sticky-action-bar">
-            <button id="newAnalysisBottom" class="secondary-button" type="button">מסמך חדש</button>
-            <button id="approveResult" class="primary-button" type="button">אישור לבדיקה אנושית</button>
+          <div class="sticky-action-bar review-bar" aria-label="החלטת בדיקה">
+            <div class="review-outcomes" role="radiogroup" aria-label="תוצאת הבדיקה">
+              <button id="approveResult" class="review-choice approve-choice" type="button" role="radio" aria-checked="false">אישור לחיוב</button>
+              <button id="recheckResult" class="review-choice recheck-choice" type="button" role="radio" aria-checked="false">סימון לבדיקה חוזרת</button>
+            </div>
+            <label id="recheckReasonWrap" class="recheck-reason hidden">סיבת הבדיקה החוזרת<input id="recheckReason" type="text" placeholder="הוסיפי סיבה קצרה..." /></label>
+            <button id="saveAndNext" class="primary-button next-button" type="button" disabled>שמירה ומעבר לבדיקה הבאה</button>
+            <button id="newAnalysisBottom" class="link-button new-document-link" type="button">מסמך חדש</button>
           </div>
         </section>
       </main>
@@ -188,6 +201,6 @@
     </div>
 
     <div id="toast" class="toast hidden" role="status"></div>
-    <script src="/app.js" type="module"></script>
+    <script src="/app.js?v=4" type="module"></script>
   </body>
 </html>
