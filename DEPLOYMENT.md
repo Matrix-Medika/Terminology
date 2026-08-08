@@ -17,11 +17,21 @@ chmod 600 .env
 עדכנו ב-`.env`:
 
 ```text
+DEBUGGING_MODE=false
+AWS_REGION=us-east-1
+AWS_BEARER_TOKEN_BEDROCK=...
+BEDROCK_MODEL_ID=us.anthropic.claude-opus-5
+BEDROCK_BASE_URL=
+BEDROCK_SERVICE_TIER=
+
+# ספק חלופי אופציונלי
 OPENAI_API_KEY=...
 OPENAI_MODEL=gpt-5.6
 ```
 
-המפתח נשאר בצד השרת בלבד.
+בפרודקשן יש להשאיר `DEBUGGING_MODE=false`. הפעילו אותו זמנית רק לצורך אבחון ביצועים, משום שהוא מוסיף נתוני תזמון לתגובה וללוג השרת (ללא תוכן רפואי או סודות).
+
+המפתחות נשארים בצד השרת בלבד. אין להוסיף אותם ל־Git, ל־Dockerfile או לקוד צד הלקוח. השאירו `BEDROCK_BASE_URL` ריק לשימוש ב־endpoint הציבורי, או הגדירו URL מלא של VPC endpoint/proxy ללא `/model` בסוף.
 
 ## 3. הפעלה
 
