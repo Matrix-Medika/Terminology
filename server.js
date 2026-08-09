@@ -8,6 +8,13 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
+import {
+  procedureCandidates,
+  diagnosisCandidates,
+  lookupCode,
+  catalogManifest,
+  HEBREW_TERMS,
+} from './lib/catalog.js';
 
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 4173);
@@ -261,11 +268,174 @@ function firstMatch(text, patterns) {
   return null;
 }
 
+/**
+ * Compares two evidence quotations for being the same observation.
+ *
+ * One is often a sub-span of the other: the local parser keeps the whole line
+ * while the model quotes the clause that mattered. Containment either way is
+ * therefore the test, not equality.
+ */
+function sameSentence(left, right) {
+  const a = cleanBidi(left || '').replace(/[.,;:]/g, '').trim();
+  const b = cleanBidi(right || '').replace(/[.,;:]/g, '').trim();
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
+}
+
 function findEvidence(text, needles) {
   const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
   for (const needle of needles) {
     const found = lines.find((line) => needle.test(line));
     if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Prefixes Hebrew attaches directly to a noun: the definite article, the common
+ * prepositions, and the conjunction ו stacked in front of them.
+ *
+ * Enumerated rather than expressed as [הובלמשכ]{0,2}, because a character class
+ * of prefix letters also matches two letters that belong to the word itself. In
+ * בשלב ("at the stage") the class consumed בש and the remaining לב matched the
+ * heart pattern, so an MRI of the knee whose report said "בשלב זה אין קרע" was
+ * coded 88.92, MRI of chest and myocardium.
+ */
+const HEBREW_PREFIXES = ['ה', 'ב', 'ל', 'מ', 'ו', 'ש', 'כ', 'וה', 'ול', 'וב', 'ומ', 'לה', 'בה', 'מה', 'שה', 'כה'];
+
+/**
+ * Words that are still misparsed as prefix + anatomy term once the prefix set is
+ * enumerated, because Hebrew genuinely is ambiguous without a lexicon: ש+לב is a
+ * grammatical reading of שלב ("stage"), and ל+שד of לשד ("marrow"). Every entry
+ * here is a word that actually occurs in radiology reports, so the collision is
+ * not hypothetical.
+ */
+const PREFIX_COLLISIONS = [
+  'שלב', 'שלבי', 'שלבים', // stage/phase — vs לב (heart)
+  'כלב', // dog — vs לב
+  'לשד', 'לשדי', // marrow, as in לשד העצמות — vs שד (breast)
+  'משבר', 'משברי', // crisis — vs שבר (fracture)
+  'בעצם', // actually — vs עצם (bone)
+  'מחזה', // spectacle — vs חזה (chest)
+];
+
+/**
+ * Builds a Hebrew word-boundary pattern source.
+ *
+ * JavaScript's \b is defined over ASCII word characters, so a Hebrew letter
+ * counts as a non-word character and /\bבטן\b/ can never match anything. The
+ * boundary has to be expressed as "no Hebrew letter on either side" instead.
+ *
+ * The trailing lookahead is what keeps שד (breast) from matching שדרה (spine)
+ * and צוואר (neck) from matching צווארי (cervical); the leading collision guard
+ * keeps a prefixed reading from inventing an organ that is not in the text.
+ */
+function hebrewWord(term) {
+  const excluded = PREFIX_COLLISIONS.join('|');
+  const prefix = `(?:${HEBREW_PREFIXES.join('|')})?`;
+  return `(?<![א-ת])(?!(?:${excluded})(?![א-ת]))${prefix}${term}(?![א-ת])`;
+}
+
+/**
+ * A radiology report states what it ruled out as often as what it found, recites
+ * relevant history, and recommends further work. All three read as the finding
+ * itself to a pattern matcher: "אין עדות לשבר" contains שבר, "מומלץ CT לשלילת
+ * ציסטה" contains ציסטה, "עבר שבר באגן ב-2019" contains שבר. Since findings are
+ * included in the coding worksheet by default, an unfiltered match becomes a
+ * diagnosis billed against a document that explicitly denies it.
+ */
+// Two properties of these cues are easy to get wrong, and both were:
+//
+// They are themselves Hebrew, so they cannot use \b either — the same ASCII-only
+// boundary that made /\bבטן\b/ unmatchable would make /\bאין\b/ unmatchable,
+// silently disabling the whole filter while every test still passed.
+//
+// And they do not all have the same scope. A particle governs what follows it,
+// so it can only suppress a finding matched to its right: "אבנים בכיס המרה ללא
+// עדות לדלקת" documents the stones and denies only the inflammation. Treating it
+// as a whole-clause veto dropped the finding the study was positive for.
+const FORWARD_NEGATION = new RegExp([
+  hebrewWord('אין'), hebrewWord('ללא'), hebrewWord('שלילת'), hebrewWord('לשלול'),
+  'no\\s+evidence', 'negative\\s+for', '\\bwithout\\b', '\\bno\\s+\\w',
+].join('|'), 'i');
+
+// Verb forms, by contrast, routinely follow their subject ("גוש נשלל", "התפליט
+// לא נראה"), so position carries no information and the whole clause is denied.
+const CLAUSE_NEGATION = new RegExp([
+  hebrewWord('נשלל'), hebrewWord('נשללה'), hebrewWord('שולל'), hebrewWord('שוללת'),
+  'לא\\s+(?:נראה|נראית|נראים|נראו|נצפ|הודגם|הודגמה|הודגמו|נמצא|נמצאה|נמצאו|קיים|קיימת|תואר|תוארה|בולט)',
+].join('|'), 'i');
+
+const HISTORY_CUES = new RegExp([
+  hebrewWord('עבר'), hebrewWord('בעבר'), hebrewWord('רקע'), hebrewWord('היסטוריה'),
+  hebrewWord('אנמנזה'), 'לאחר\\s+ניתוח', 'status\\s*post', '\\bs/p\\b',
+].join('|'), 'i');
+
+const PLAN_CUES = new RegExp([
+  hebrewWord('מומלץ'), hebrewWord('מומלצת'), hebrewWord('להשלמה'),
+  'יש\\s+ל(?:בצע|השלים|שקול)', 'נדרשת?\\s+בדיקה', 'לצורך\\s+בירור',
+  'במידת\\s+הצורך', 'follow[-\\s]?up',
+].join('|'), 'i');
+
+/**
+ * Splits a line into the spans that can carry independent claims, so that a
+ * denial in one clause does not suppress an affirmed finding in the next —
+ * "ללא תפליט, קיים גוש בריאה" states both.
+ */
+function splitClauses(line) {
+  return line
+    .split(/[.;,]|\s(?:אך|אבל|ואולם|לעומת\s+זאת)\s/)
+    .map((clause) => clause.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Reports whether a finding matched at `matchIndex` inside `scope` is denied.
+ *
+ * `matchIndex` is what makes the forward cues usable: a denial that appears only
+ * *after* the finding is a statement about something else in the same clause.
+ */
+function isUnaffirmed(scope, matchIndex = 0) {
+  if (CLAUSE_NEGATION.test(scope) || HISTORY_CUES.test(scope) || PLAN_CUES.test(scope)) return true;
+  const forward = new RegExp(FORWARD_NEGATION.source, 'gi');
+  for (const cue of scope.matchAll(forward)) {
+    if (cue.index < matchIndex) return true;
+  }
+  return false;
+}
+
+/**
+ * Where the finding starts inside `scope`, or 0 if it cannot be located — which
+ * places it before every cue and so keeps the conservative reading.
+ */
+function matchOffset(scope, needles) {
+  const offsets = needles.map((needle) => scope.search(needle)).filter((index) => index >= 0);
+  return offsets.length > 0 ? Math.min(...offsets) : 0;
+}
+
+/**
+ * Finds a line that actually asserts the finding as present on this study.
+ *
+ * The negation check is scoped to the clause the match sits in, but falls back
+ * to the whole line when the match spans a clause break — rejecting a borderline
+ * finding is recoverable, coding a denied one is not.
+ */
+function findAffirmedEvidence(text, needles, { assertsAbsence = false } = {}) {
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (!needles.some((needle) => needle.test(line))) continue;
+    if (assertsAbsence) return line;
+    // A finding can be denied in one clause and affirmed in another, so every
+    // clause that mentions it gets judged on its own before the line is dropped.
+    const scopes = splitClauses(line).filter((clause) => needles.some((needle) => needle.test(clause)));
+    // The match straddles a clause break, so no clause holds it intact and the
+    // whole line has to answer for it.
+    if (scopes.length === 0) {
+      if (isUnaffirmed(line, matchOffset(line, needles))) continue;
+      return line;
+    }
+    if (scopes.every((scope) => isUnaffirmed(scope, matchOffset(scope, needles)))) continue;
+    return line;
   }
   return null;
 }
@@ -309,30 +479,149 @@ function detectPatient(text) {
   };
 }
 
+/** Combines Hebrew-boundary terms and plain patterns into one regex. */
+function hebrewPattern(hebrewTerms, extra = '') {
+  const sources = hebrewTerms.map(hebrewWord);
+  if (extra) sources.push(extra);
+  return new RegExp(sources.join('|'), 'i');
+}
+
+/**
+ * Imaging modalities, most specific first. The order is load-bearing:
+ * mammography is a form of radiography and PET is usually acquired as PET-CT,
+ * so the broader term must never win over the narrower one.
+ */
+const MODALITY_PATTERNS = [
+  { modality: 'MRI', pattern: /\bMRI\b|\bMRA\b|תהודה\s*מגנטית/i },
+  { modality: 'PET', pattern: /\bPET\b|טומוגרפיית\s*פליטת\s*פוזיטרונים/i },
+  { modality: 'MAMMO', pattern: /ממוגרפיה|ממוגרם|\bmammograph/i },
+  { modality: 'CT', pattern: /\bCT\b|\bCTA\b|טומוגרפיה\s*ממוחשבת/i },
+  { modality: 'US', pattern: /אולטרסאונד|אולטרה\s*סאונד|על[-\s]?קולי|דופלר|\bultrasound\b|\bdoppler\b/i },
+  { modality: 'XRAY', pattern: /רנטגן|צילום\s*(?:רנטגן|חזה|בטן|גפ|עצמ|שלד)|\bx-?ray\b/i },
+];
+
+/**
+ * Anatomical regions, again most specific first. The spinal regions are matched
+ * before the brain on purpose: Hebrew reports call the spinal cord "מוח השדרה",
+ * so a looser brain pattern would silently reclassify a spine study as a head
+ * study — the exact error this pipeline is supposed to make impossible.
+ *
+ * The region keys are the ones the catalog's anatomy facet knows about; adding a
+ * region here without adding it to HEBREW_TERMS.anatomy yields modality-only
+ * candidates rather than a wrong code.
+ */
+const BODY_REGION_PATTERNS = [
+  { region: 'cervical_spine', site: 'עמוד שדרה צווארי', pattern: /ע["״']?ש\s*צווארי|עמוד\s*שדרה\s*צווארי|cervical\s*spine/i },
+  { region: 'thoracic_spine', site: 'עמוד שדרה גבי', pattern: /ע["״']?ש\s*(?:גבי|חזי|תורקלי)|עמוד\s*שדרה\s*(?:גבי|חזי|תורקלי)|thoracic\s*spine/i },
+  { region: 'lumbar_spine', site: 'עמוד שדרה מותני', pattern: /ע["״']?ש\s*(?:מותני|לומברי)|עמוד\s*שדרה\s*מותני|lumbar\s*spine|lumbosacral/i },
+  { region: 'breast', site: 'שד', pattern: hebrewPattern(['שד', 'שדיים', 'ממוגרפיה'], '\\bbreast\\b') },
+  // Anchored to an imaging verb so that "מוח השדרה" (the spinal cord) and
+  // incidental mentions of the brain cannot turn a study into a head study.
+  { region: 'brain', site: 'מוח', pattern: /(?:MRI|CT|PET|בדיקת|סריקת|צילום)\s*(?:CT\s*)?(?:של\s*)?(?:ה)?מוח(?![\sא-ת]*שדרה)|\bbrain\b/i },
+  { region: 'abdomen_pelvis', site: 'בטן ואגן', pattern: /בטן\s*ו?אגן|abdomen\s*and\s*pelvis/i },
+  { region: 'abdomen', site: 'בטן', pattern: hebrewPattern(['בטן', 'כבד', 'טחול', 'לבלב'], '\\babdom') },
+  { region: 'pelvis', site: 'אגן', pattern: hebrewPattern(['אגן', 'רחם', 'שחלות'], '\\bpelvi') },
+  { region: 'chest', site: 'חזה', pattern: hebrewPattern(['חזה', 'ריאות', 'ריאה'], '\\bchest\\b|\\bthorax\\b|\\blungs?\\b') },
+  { region: 'heart', site: 'לב', pattern: hebrewPattern(['לב', 'קרדיאלי'], '\\bcardiac\\b') },
+  { region: 'neck', site: 'צוואר', pattern: hebrewPattern(['צוואר', 'תריס'], '\\bneck\\b|\\bthyroid\\b') },
+  { region: 'urinary', site: 'דרכי השתן', pattern: hebrewPattern(['כליה', 'כליות', 'שופכן', 'שלפוחית'], '\\bkidneys?\\b|\\brenal\\b|\\burinary\\b') },
+  { region: 'musculoskeletal', site: 'שלד ושרירים', pattern: hebrewPattern(['כתף', 'ירך', 'ברך', 'קרסול', 'מרפק', 'גפה', 'עצם', 'עצמות'], '\\bknee\\b|\\bshoulder\\b|\\bhip\\b') },
+  { region: 'whole_body', site: 'גוף שלם', pattern: /גוף\s*שלם|\bwhole\s*body\b/i },
+];
+
+/**
+ * Phrases that introduce the study actually being reported, e.g. "בדיקת CT",
+ * "צילום חזה", "להלן ממצאי בדיקת MRI".
+ */
+const STUDY_DECLARATION = /(?:להלן\s*)?(?:ממצאי\s*)?(?:בדיקת|בדיקה|סריקת|צילום|פענוח|ביצוע)\s*[^\n]{0,40}/gi;
+
+/**
+ * Phrases that introduce a *previous* study rather than the one being reported.
+ *
+ * Radiologists compare against priors constantly — "בהשוואה לבדיקת CT קודמת
+ * מ-2024" — and that phrase is itself a study declaration, so it was outvoting
+ * the study actually performed: an abdominal ultrasound came out as CT. A
+ * comparison is far more common in real reports than the letterhead this
+ * declaration logic was originally written to defeat.
+ */
+const PRIOR_STUDY = new RegExp([
+  'בהשוואה', 'השוואה\\s+ל', hebrewWord('קודמת'), hebrewWord('קודם'), hebrewWord('קודמים'),
+  hebrewWord('הקודמת'), hebrewWord('הקודם'), hebrewWord('קודמות'), 'מתאריך', hebrewWord('עבר'),
+].join('|'), 'i');
+
+/**
+ * Resolves the modality, preferring the one named where the study is declared.
+ *
+ * An imaging centre's letterhead names its equipment — "מכון MRI" — and a plain
+ * whole-document scan lets that letterhead outvote the study itself: a CT of the
+ * abdomen was coded as an MRI purely because the header said MRI. So the study
+ * declaration lines are searched first, and the whole document only as a
+ * fallback for reports that never phrase the study that way.
+ *
+ * Declarations describing a prior study are dropped before the vote, and the
+ * whole-document fallback is likewise taken from lines that are not comparisons.
+ */
+function detectModality(text) {
+  const declarations = (text.match(STUDY_DECLARATION) || [])
+    .filter((declaration) => !PRIOR_STUDY.test(declaration))
+    .join('\n');
+  const currentLines = text
+    .split('\n')
+    .filter((line) => !PRIOR_STUDY.test(line))
+    .join('\n');
+  return MODALITY_PATTERNS.find((entry) => entry.pattern.test(declarations))?.modality
+    || MODALITY_PATTERNS.find((entry) => entry.pattern.test(currentLines))?.modality
+    || MODALITY_PATTERNS.find((entry) => entry.pattern.test(text))?.modality
+    || null;
+}
+
+/**
+ * Maps a free-text anatomical site to a catalog region, using the same patterns
+ * the document parser uses. Lets an AI-supplied site be resolved through exactly
+ * the reviewed vocabulary rather than being passed to retrieval verbatim.
+ */
+function resolveBodyRegion(site) {
+  if (!site) return null;
+  return BODY_REGION_PATTERNS.find((entry) => entry.pattern.test(site))?.region || null;
+}
+
 function detectProcedure(text) {
-  const modality = /\bMRI\b|תהודה\s*מגנטית/i.test(text)
-    ? 'MRI'
-    : /\bCT\b|טומוגרפיה\s*ממוחשבת/i.test(text)
-      ? 'CT'
-      : null;
+  const modality = detectModality(text);
+  // Anatomy is read from the current study only, for the same reason as the
+  // modality: "בהשוואה ל-CT בטן קודם" must not set the region of a knee MRI.
+  const currentText = text.split('\n').filter((line) => !PRIOR_STUDY.test(line)).join('\n');
+  const region = BODY_REGION_PATTERNS.find((entry) => entry.pattern.test(currentText))
+    || BODY_REGION_PATTERNS.find((entry) => entry.pattern.test(text))
+    || null;
+  const anatomicalSite = region?.site || null;
+  const bodyRegion = region?.region || null;
 
-  let anatomicalSite = null;
-  let bodyRegion = null;
-  if (/ע["״']?ש\s*צווארי|עמוד\s*שדרה\s*צווארי|cervical\s*spine/i.test(text)) {
-    anatomicalSite = 'עמוד שדרה צווארי';
-    bodyRegion = 'cervical_spine';
-  } else if (/MRI\s*(?:של\s*)?מוח|brain\s*MRI/i.test(text)) {
-    anatomicalSite = 'מוח';
-    bodyRegion = 'brain';
-  } else if (/עמוד\s*שדרה\s*מותני|lumbar\s*spine/i.test(text)) {
-    anatomicalSite = 'עמוד שדרה מותני';
-    bodyRegion = 'lumbar_spine';
-  } else if (/בטן\s*ואגן|abdomen\s*and\s*pelvis/i.test(text)) {
-    anatomicalSite = 'בטן ואגן';
-    bodyRegion = 'abdomen_pelvis';
-  }
+  // "בוצעה בתאריך" is the load-bearing phrase and it does not always follow the
+  // word "הבדיקה" — reports write "בדיקת CT של הבטן בוצעה בתאריך" just as often.
+  // Requiring the literal "הבדיקה" made a performed study look unperformed,
+  // which now suppresses its procedure code, so the phrasing must be matched on
+  // its own. A findings section is also evidence: a radiologist does not report
+  // findings for a study that was not carried out.
+  //
+  // The signature is deliberately not sufficient by itself: a referral gets
+  // signed too, and treating that as proof of performance coded a study that had
+  // not happened — the one error this tool exists to prevent.
+  const performedEvidence = /בוצע(?:ה|ו)?\s*(?:ב)?תאריך|להלן\s*ממצאי\s*בדיקת|ממצאי\s*הבדיקה/i.test(text);
 
-  const performed = /הבדיקה\s*בוצעה\s*בתאריך|להלן\s*ממצאי\s*בדיקת|מסמך\s*זה\s*נחתם\s*אלקטרונית/i.test(text);
+  // The negative guard has to be scoped to the study itself. Applied to the
+  // whole document it fired on unrelated sentences: "לא בוצעה הזרקת חומר ניגוד"
+  // describes the contrast, and "מומלץ לבצע MRI להשלמה" describes a *further*
+  // study — both suppressed the code for a study that was demonstrably done.
+  const notPerformed = text.split('\n').some((line) => splitClauses(line).some((clause) => {
+    if (!/טרם\s*בוצע|לא\s*בוצע(?:ה|ו)?|מומלץ\s*לבצע|יש\s*לבצע/i.test(clause)) return false;
+    // A clause about contrast, or about a different modality than the one being
+    // reported, is not a statement that this study was skipped.
+    if (/ניגוד|גדוליניום|הזרקה?|contrast/i.test(clause)) return false;
+    const clauseModality = MODALITY_PATTERNS.find((entry) => entry.pattern.test(clause))?.modality;
+    return !clauseModality || !modality || clauseModality === modality;
+  }));
+
+  const performed = performedEvidence && !notPerformed;
   const signed = /מסמך\s*זה\s*נחתם\s*אלקטרונית|חתום\s*אלקטרונית/i.test(text);
   const status = performed ? 'בוצע' : /הפניה|המלצה|מתוכנן/i.test(text) ? 'מתוכנן' : 'לא ידוע';
 
@@ -391,169 +680,384 @@ function detectDocument(text) {
   };
 }
 
-function detectFindings(text) {
-  const definitions = [
-    {
-      key: 'cervical_stenosis',
-      label: 'היצרות תעלת השדרה הצווארית',
-      patterns: [/היצרות\s+(?:מתונה\s+)?של\s+תעלת\s+השדרה\s+הצווארית/i, /היצרות\s+בתעלה/i],
-      severity: 'משמעותי',
-    },
-    {
-      key: 'myelopathy',
-      label: 'שינויים מיאלופתיים',
-      patterns: [/שינויי\s+אות\s+מיאלופתיים/i, /מיאלופת/i],
-      severity: 'משמעותי',
-    },
-    {
-      key: 'disc_degeneration',
-      label: 'שינויים ניווניים דיסקליים',
-      patterns: [/שינויים\s+ניווניים\s+דיסקליים/i, /היצרות\s+וני(?:ו|י)ון\s+הדיסק/i],
-      severity: 'בינוני',
-    },
-    {
-      key: 'foraminal_stenosis',
-      label: 'היצרות פורמינלית',
-      patterns: [/היצרות\s+(?:משמעותית\s+)?של\s+הנקבים/i, /פורמינל/i],
-      severity: 'בינוני',
-    },
-    {
-      key: 'radicular_effect',
-      label: 'אפקט רדיקולרי דו־צדדי',
-      patterns: [/אפקט\s+רדיקולרי\s+דו["״']?צ/i, /תלונות\s+רדיקולריות\s+דו["״']?צ/i],
-      severity: 'בינוני',
-    },
-    {
-      key: 'disc_bulge',
-      label: 'בלטי דיסק',
-      patterns: [/בלט\s+דיסק/i, /קומפלקס\s+דיסק/i],
-      severity: 'בינוני',
-    },
-    {
-      key: 'lordosis_straightening',
-      label: 'יישור הלורדוזה',
-      patterns: [/יישור\s+הלורדוזה/i, /העמדה\s+הלורדוטית\s+מופחתת/i],
-      severity: 'קל',
-    },
-  ];
+/**
+ * Clinical findings, each with the English terms used to retrieve its diagnosis
+ * candidates. The terms are deliberately stored next to the Hebrew pattern: the
+ * finding is a clinical fact, and its English wording is what lets the ICD-9
+ * catalog be searched for it without the model ever composing a code.
+ */
+const FINDING_DEFINITIONS = [
+  {
+    key: 'cervical_stenosis',
+    label: 'היצרות תעלת השדרה הצווארית',
+    patterns: [/היצרות\s+(?:מתונה\s+)?של\s+תעלת\s+השדרה\s+הצווארית/i, /היצרות\s+בתעלה/i],
+    severity: 'משמעותי',
+    searchTerms: ['spinal stenosis', 'cervical region'],
+  },
+  {
+    key: 'myelopathy',
+    label: 'שינויים מיאלופתיים',
+    patterns: [/שינויי\s+אות\s+מיאלופתיים/i, /מיאלופת/i],
+    severity: 'משמעותי',
+    searchTerms: ['myelopathy', 'spinal cord'],
+  },
+  {
+    key: 'disc_degeneration',
+    label: 'שינויים ניווניים דיסקליים',
+    patterns: [/שינויים\s+ניווניים\s+דיסקליים/i, /היצרות\s+וני(?:ו|י)ון\s+הדיסק/i],
+    severity: 'בינוני',
+    searchTerms: ['degeneration of intervertebral disc'],
+  },
+  {
+    key: 'foraminal_stenosis',
+    label: 'היצרות פורמינלית',
+    patterns: [/היצרות\s+(?:משמעותית\s+)?של\s+הנקבים/i, /פורמינל/i],
+    severity: 'בינוני',
+    searchTerms: ['spinal stenosis', 'intervertebral foramen'],
+  },
+  {
+    key: 'radicular_effect',
+    label: 'אפקט רדיקולרי דו־צדדי',
+    patterns: [/אפקט\s+רדיקולרי\s+דו["״']?צ/i, /תלונות\s+רדיקולריות\s+דו["״']?צ/i],
+    severity: 'בינוני',
+    searchTerms: ['radiculitis', 'nerve root'],
+  },
+  {
+    key: 'disc_bulge',
+    label: 'בלטי דיסק',
+    patterns: [/בלט\s+דיסק/i, /קומפלקס\s+דיסק/i],
+    severity: 'בינוני',
+    searchTerms: ['displacement of intervertebral disc'],
+  },
+  {
+    key: 'disc_herniation',
+    label: 'פריצת דיסק',
+    patterns: [/פריצת\s+דיסק/i, /הרניאצי[הת]\s+של\s+הדיסק/i, /\bherniat/i],
+    severity: 'משמעותי',
+    searchTerms: ['displacement of intervertebral disc', 'herniation'],
+  },
+  {
+    key: 'lordosis_straightening',
+    label: 'יישור הלורדוזה',
+    patterns: [/יישור\s+הלורדוזה/i, /העמדה\s+הלורדוטית\s+מופחתת/i],
+    severity: 'קל',
+    searchTerms: ['curvature of spine', 'lordosis'],
+  },
+  {
+    key: 'fracture',
+    label: 'שבר',
+    patterns: [hebrewPattern(['שבר', 'שברים']), /\bfracture\b/i],
+    severity: 'משמעותי',
+    searchTerms: ['fracture'],
+  },
+  {
+    key: 'mass_lesion',
+    label: 'נגע חשוד / גוש',
+    patterns: [hebrewPattern(['גוש', 'גושים']), /נגע\s+חשוד/i, /חשד\s+לממאירות/i, /\bmass\b|\blesion\b/i],
+    severity: 'משמעותי',
+    // ICD-9 files "swelling, mass, or lump" by body site, so a bare "mass"
+    // query retrieves whichever site scores best — it returned "379.92 Swelling
+    // or mass of eye" for a brain study. A mass must be coded to the site it was
+    // seen in, so this finding is only searchable together with the anatomy the
+    // study examined.
+    searchTerms: ['swelling mass or lump'],
+    requiresSite: true,
+  },
+  {
+    key: 'cyst',
+    label: 'ציסטה',
+    patterns: [/ציסט[הות]/i, /\bcyst\b/i],
+    severity: 'בינוני',
+    searchTerms: ['cyst'],
+  },
+  {
+    key: 'hepatomegaly',
+    label: 'הגדלת כבד',
+    patterns: [/כבד\s+מוגדל/i, /הגדלת\s+(?:ה)?כבד/i, /\bhepatomegaly\b/i],
+    severity: 'בינוני',
+    searchTerms: ['hepatomegaly', 'enlarged liver'],
+  },
+  {
+    key: 'fatty_liver',
+    label: 'כבד שומני',
+    patterns: [/כבד\s+שומני/i, /סטאטוזיס/i, /\bsteatosis\b/i],
+    severity: 'בינוני',
+    searchTerms: ['fatty liver', 'fatty degeneration of liver'],
+  },
+  {
+    key: 'cholelithiasis',
+    label: 'אבנים בכיס המרה',
+    patterns: [/אבנים?\s+בכיס\s+המרה/i, /כוליתיאזיס/i, /\bcholelithiasis\b/i],
+    severity: 'משמעותי',
+    searchTerms: ['calculus of gallbladder', 'cholelithiasis'],
+  },
+  {
+    key: 'nephrolithiasis',
+    label: 'אבנים בכליה',
+    patterns: [/אבנים?\s+בכלי[הו]/i, /אבן\s+בשופכן/i, /\bnephrolithiasis\b/i],
+    severity: 'משמעותי',
+    searchTerms: ['calculus of kidney', 'calculus of ureter'],
+  },
+  {
+    key: 'pleural_effusion',
+    label: 'תפליט פלאורלי',
+    patterns: [/תפליט\s+פלאורלי/i, /נוזל\s+בחלל\s+הפלאורה/i, /\bpleural effusion\b/i],
+    severity: 'משמעותי',
+    searchTerms: ['pleural effusion'],
+  },
+  {
+    key: 'pulmonary_infiltrate',
+    label: 'תסנין ריאתי',
+    patterns: [/תסנין/i, /דלקת\s+ריאות/i, /\binfiltrat/i, /\bpneumonia\b/i],
+    severity: 'משמעותי',
+    // "pneumonia" alone retrieves the organism-specific codes (anthrax,
+    // aspergillosis, Pseudomonas), none of which an imaging report can
+    // establish. Imaging shows the infiltrate, not the pathogen, so the query
+    // targets the organism-unspecified and radiological-finding codes.
+    searchTerms: ['pneumonia organism unspecified', 'lung field abnormal findings'],
+  },
+  {
+    key: 'pulmonary_nodule',
+    label: 'קשריות ריאתית',
+    patterns: [/קשרי(?:ת|ות)\s+(?:ב)?ריא/i, /\bnodule\b/i],
+    severity: 'משמעותי',
+    searchTerms: ['solitary pulmonary nodule', 'lung'],
+  },
+  {
+    key: 'osteoarthritis',
+    label: 'שינויים ניווניים מפרקיים',
+    patterns: [/שינויים\s+ניווניים\s+(?:ב)?מפרק/i, /אוסטאוארתריטיס/i, /\bosteoarthr/i],
+    severity: 'בינוני',
+    searchTerms: ['osteoarthrosis'],
+  },
+  {
+    key: 'no_pathology',
+    label: 'ללא ממצא פתולוגי',
+    patterns: [/ללא\s+ממצא\s+פתולוגי/i, /בדיקה\s+תקינה/i, /ממצאים\s+תקינים/i],
+    severity: 'תקין',
+    searchTerms: [],
+    // This finding *is* the absence statement, so the negation filter that
+    // protects the others would delete exactly the reports it applies to.
+    assertsAbsence: true,
+  },
+];
 
-  return definitions
+function detectFindings(text) {
+  return FINDING_DEFINITIONS
     .map((definition) => {
-      const evidence = findEvidence(text, definition.patterns);
+      const evidence = findAffirmedEvidence(text, definition.patterns, {
+        assertsAbsence: definition.assertsAbsence,
+      });
       return evidence ? {
         key: definition.key,
         label: definition.label,
         severity: definition.severity,
         evidence,
-        certainty: 0.95,
+        // A pattern match on an affirmed clause, not a clinical probability. The
+        // coder reads the quoted evidence; this only orders the list.
+        certainty: 0.9,
+        searchTerms: definition.searchTerms,
       } : null;
     })
     .filter(Boolean);
 }
 
+/**
+ * Turns a catalog hit into the shape the UI expects.
+ *
+ * The score is BM25-derived, so it measures how well the wording matched — not
+ * how likely the code is to be correct. Exposing it as a normalised "match"
+ * percentage keeps that honest: it ranks the candidate list, and it is not a
+ * clinical confidence.
+ */
+function asCandidate(entry, best) {
+  return {
+    code: entry.code,
+    display: entry.display,
+    context: entry.context?.slice(-1)[0] || null,
+    match: best > 0 ? Math.round((entry.score / best) * 100) : null,
+    // Whether the code matched every facet searched, or only some of them. A
+    // partial match is listed for the coder but is not evidence-ranked, so the
+    // UI has to be able to say so rather than presenting it as a near miss.
+    partial: entry.groundedInAllFacets === false ? true : undefined,
+  };
+}
+
+/** Systems that are genuinely not available in this deployment. */
+function unavailable(system, reason) {
+  return {
+    system,
+    code: null,
+    display: reason,
+    status: 'unavailable',
+    confidence: 0,
+    source: reason,
+  };
+}
+
+const SNOMED_UNAVAILABLE = 'SNOMED CT דורש רישוי חבר לאומי — הקטלוג אינו טעון';
+const TARIFF_UNAVAILABLE = 'מחירון משרד הבריאות לא נטען — נדרשת טעינה ידנית';
+
+/**
+ * Retrieves the ICD-9 procedure candidates for the extracted facts.
+ *
+ * Nothing here decides what the procedure was; that was already decided by
+ * detectProcedure from the document text. This step only looks the facts up in
+ * the catalog, and returns the whole candidate list so a coder — or the model,
+ * constrained to that list — makes the final choice.
+ */
 function procedureTerminology(procedure) {
-  if (procedure.modality === 'MRI' && procedure.bodyRegion === 'cervical_spine') {
-    return {
-      icd9: {
-        system: 'ICD-9-CM · Procedure',
-        code: '88.93',
-        display: 'Magnetic resonance imaging of spinal canal',
-        status: 'matched',
-        confidence: 0.98,
-        source: 'קטלוג ICD-9-CM טעון',
-      },
-      snomed: {
-        system: 'SNOMED CT · Procedure',
-        code: '241646009',
-        display: 'Magnetic resonance imaging of cervical spine',
-        status: 'matched',
-        confidence: 0.99,
-        source: 'שירות טרמינולוגיה טעון',
-      },
-      billing: {
-        system: 'קוד שירות משרד הבריאות',
-        code: 'L0444',
-        display: 'MRI — בדיקה בתהודה מגנטית, למעט בדיקות בעלות קוד ייעודי',
-        status: 'candidate',
-        confidence: 0.93,
-        source: 'מחירון משרד הבריאות טעון',
-      },
-    };
-  }
-
-  if (procedure.modality === 'MRI') {
-    return {
-      icd9: {
-        system: 'ICD-9-CM · Procedure',
-        code: null,
-        display: 'נדרשת אנטומיה מדויקת לצורך התאמה',
-        status: 'needs_review',
-        confidence: 0.45,
-        source: 'קטלוג ICD-9-CM',
-      },
-      snomed: {
-        system: 'SNOMED CT · Procedure',
-        code: '113091000',
-        display: 'Magnetic resonance imaging',
-        status: 'candidate',
-        confidence: 0.62,
-        source: 'שירות טרמינולוגיה',
-      },
-      billing: {
-        system: 'קוד שירות',
-        code: null,
-        display: 'לא זוהה קוד שירות ספציפי',
-        status: 'needs_review',
-        confidence: 0.3,
-        source: 'מחירון טעון',
-      },
-    };
-  }
-
-  return {
-    icd9: { system: 'ICD-9-CM · Procedure', code: null, display: 'לא זוהתה פרוצדורה', status: 'not_applicable', confidence: 0, source: 'קטלוג' },
-    snomed: { system: 'SNOMED CT · Procedure', code: null, display: 'לא זוהתה פרוצדורה', status: 'not_applicable', confidence: 0, source: 'שירות טרמינולוגיה' },
-    billing: { system: 'קוד שירות', code: null, display: 'לא זוהה שירות לחיוב', status: 'not_applicable', confidence: 0, source: 'מחירון' },
-  };
-}
-
-function findingTerminology(findings) {
-  const mapping = {
-    cervical_stenosis: {
-      snomed: { code: '83561009', display: 'Spinal stenosis in cervical region' },
-      icd9: { code: '723.0', display: 'Spinal stenosis in cervical region' },
+  const candidates = procedureCandidates(
+    {
+      modality: procedure.modality,
+      bodyRegion: procedure.bodyRegion,
+      contrast: procedure.contrast,
     },
-  };
-
-  return findings.map((finding) => ({
-    findingKey: finding.key,
-    label: finding.label,
-    evidence: finding.evidence,
-    snomed: mapping[finding.key]?.snomed || { code: null, display: 'מועמד טרמינולוגי — דורש אימות' },
-    icd9: mapping[finding.key]?.icd9 || { code: null, display: 'מועמד — דורש אימות מקודד' },
-  }));
-}
-
-function buildBilling(procedure, terminology) {
-  const reportSupportsPerformance = procedure.performed && procedure.signed;
-  const serviceCodeAvailable = Boolean(terminology.billing.code);
-  const eligible = reportSupportsPerformance && serviceCodeAvailable;
+    { limit: 6 },
+  );
+  const manifest = catalogManifest();
+  const bestScore = candidates[0]?.score || 0;
+  // Two conditions have to hold before a code is put forward, and in both cases
+  // the candidate list is still shown so a coder can work from it:
+  //
+  // 1. The study has to be documented as performed. A referral names a modality
+  //    and a body part, so retrieval finds a code for it happily, and coding a
+  //    study that never happened is the worst failure this tool can have.
+  // 2. The top candidate has to match both the modality and the anatomy. A code
+  //    that matched only the modality is ranked by its code number, not by
+  //    evidence, so promoting it means offering an arbitrary site: every
+  //    anatomy-less CT resolved to 87.71, "CT of kidney".
+  const leading = candidates[0];
+  const grounded = leading?.groundedInAllFacets === true;
+  const top = procedure.performed && grounded ? leading : null;
 
   return {
-    eligibility: eligible ? 'בר־חיוב לפי תיעוד הביצוע' : 'נדרשת השלמת מידע',
+    icd9: {
+      system: 'ICD-9-CM · Procedure',
+      code: top?.code || null,
+      display: top?.display || (!procedure.modality
+        ? 'לא זוהתה פרוצדורה'
+        : (!procedure.performed
+          ? 'הבדיקה לא תועדה כבוצעה — אין קוד לחיוב'
+          : (!procedure.bodyRegion
+            ? 'לא זוהתה אנטומיה — נדרשת בחירת מקודד מתוך הרשימה'
+            : 'אין קוד המתאים גם למודאליות וגם לאנטומיה — נדרשת בחירת מקודד'))),
+      // Even the best-scoring hit is a candidate, never a decision: the catalog
+      // ranks wording, and only a coder can confirm the code.
+      status: top
+        ? 'candidate'
+        : (!procedure.modality ? 'not_applicable' : (procedure.performed ? 'needs_review' : 'not_performed')),
+      confidence: top ? null : 0,
+      source: manifest.edition,
+      candidates: candidates.map((entry) => asCandidate(entry, bestScore)),
+    },
+    snomed: unavailable('SNOMED CT · Procedure', SNOMED_UNAVAILABLE),
+    billing: unavailable('קוד שירות משרד הבריאות', TARIFF_UNAVAILABLE),
+  };
+}
+
+/**
+ * Retrieves ICD-9 diagnosis candidates for each extracted finding.
+ *
+ * `bodyRegion` comes from the procedure, because some findings cannot be coded
+ * without it: ICD-9 files "swelling, mass, or lump" by site, so a mass is only
+ * codable together with the region the study examined.
+ */
+function findingTerminology(findings, bodyRegion = null) {
+  const manifest = catalogManifest();
+  const siteTerms = bodyRegion ? (HEBREW_TERMS.anatomy[bodyRegion] || []) : [];
+
+  return findings.map((finding) => {
+    const definition = FINDING_DEFINITIONS.find((item) => item.key === finding.key);
+    // Only curated search terms are used to retrieve a code. An earlier version
+    // fell back to the model's own free-text label, which quietly turned the
+    // model into the source of the code after all: "Hepatic steatosis" retrieved
+    // 573.4 Hepatic infarction, "aortic atherosclerosis" retrieved 395.0
+    // Rheumatic aortic stenosis, and "mild degenerative changes" retrieved an
+    // eye code — every one a real catalog entry, so every one passing the
+    // never-invent-a-code check while asserting something the report does not.
+    // A finding the catalog cannot be searched for by curated terms is shown to
+    // the coder uncoded, which is the honest outcome.
+    const baseTerms = finding.searchTerms || definition?.searchTerms || [];
+    // A site-dependent finding with no known site yields no candidates rather
+    // than an arbitrarily sited code.
+    const terms = definition?.requiresSite
+      ? (siteTerms.length ? [...baseTerms, ...siteTerms] : [])
+      : baseTerms;
+    const candidates = diagnosisCandidates(terms, { limit: 5 });
+    const best = candidates[0]?.score || 0;
+    // No absolute score threshold is applied, because BM25 scores are not
+    // comparable across queries and measuring it showed the ranges overlap
+    // completely: "fracture" legitimately scores 6.8 and "cyst" 10.6, while the
+    // junk query "mild degenerative changes" scores 21.9. Any cutoff that
+    // rejected the junk would also reject real findings. Restricting retrieval
+    // to curated terms is what actually closes that hole — it stops the junk
+    // query from being issued at all.
+    const top = candidates[0] || null;
+
+    return {
+      findingKey: finding.key,
+      label: finding.label,
+      evidence: finding.evidence,
+      icd9: {
+        system: 'ICD-9-CM · Diagnosis',
+        code: top?.code || null,
+        display: top?.display
+          || (definition?.requiresSite && !siteTerms.length
+            ? 'נדרשת אנטומיה לצורך קידוד הממצא'
+            : 'לא נמצא קוד מתאים בקטלוג'),
+        status: top ? 'candidate' : 'needs_review',
+        source: manifest.edition,
+        candidates: candidates.map((entry) => asCandidate(entry, best)),
+      },
+      snomed: unavailable('SNOMED CT · Finding', SNOMED_UNAVAILABLE),
+    };
+  });
+}
+
+/**
+ * Assesses billability.
+ *
+ * The Israeli MoH tariff is not loaded in this deployment, so no submittable
+ * service code can be produced and `eligible` is always false. That is reported
+ * as a missing catalog rather than a documentation problem — telling a user to
+ * fix their report when the software is the thing that is incomplete would send
+ * them chasing the wrong thing.
+ */
+function buildBilling(procedure, terminology) {
+  const performanceDocumented = Boolean(procedure.performed && procedure.signed);
+  const procedureCodeAvailable = Boolean(terminology.icd9.code);
+  const serviceCodeAvailable = Boolean(terminology.billing.code);
+  const eligible = performanceDocumented && procedureCodeAvailable && serviceCodeAvailable;
+
+  return {
+    eligibility: eligible
+      ? 'בר־חיוב לפי תיעוד הביצוע'
+      : (serviceCodeAvailable ? 'נדרשת השלמת מידע' : 'לא ניתן לקבוע — מחירון לא טעון'),
     eligible,
+    performanceDocumented,
     code: terminology.billing.code,
     display: terminology.billing.display,
     performanceEvidence: procedure.evidence,
-    amountStatus: eligible ? 'מחיר רשמי ניתן להצגה לאחר בחירת תאריך ותעריף' : 'לא ניתן לחשב',
+    amountStatus: 'לא ניתן לחשב — מחירון משרד הבריאות אינו טעון במערכת',
     claimStatus: 'סכום סופי להגשה תלוי במבטח, בהסכם ובהתחייבות',
     warnings: [
       procedure.contrast === 'לא תועד' ? 'חומר ניגוד לא תועד במסמך' : null,
-      eligible ? null : 'אין עדיין הוכחת ביצוע מספקת או קוד שירות מאומת',
+      !performanceDocumented ? 'אין תיעוד מלא של ביצוע הבדיקה וחתימה' : null,
+      !procedureCodeAvailable ? 'לא נבחר קוד פרוצדורה מהקטלוג' : null,
+      !serviceCodeAvailable ? TARIFF_UNAVAILABLE : null,
     ].filter(Boolean),
   };
 }
 
+/**
+ * Scores how completely the document was understood.
+ *
+ * Only facts the document can actually supply are scored. The terminology term
+ * asks whether the catalog returned candidates at all — scoring the presence of
+ * a SNOMED code, as this once did, permanently capped the score for a reason
+ * that has nothing to do with the document in front of the user.
+ */
 function calculateConfidence({ patient, procedure, document, findings, terminology }) {
   let score = 0;
   let weight = 0;
@@ -566,7 +1070,7 @@ function calculateConfidence({ patient, procedure, document, findings, terminolo
   add(procedure.signed, 10);
   add(Boolean(document.radiologist), 5);
   add(findings.length > 0, 10);
-  add(Boolean(terminology.icd9.code && terminology.snomed.code), 10);
+  add(Boolean(terminology.icd9.code), 10);
   return Math.round((score / weight) * 100);
 }
 
@@ -622,6 +1126,14 @@ DOCUMENT:
         ...baseAnalysis.procedure,
         modality: baseAnalysis.procedure.modality || ai.procedure?.modality || null,
         anatomicalSite: baseAnalysis.procedure.anatomicalSite || ai.procedure?.anatomicalSite || null,
+        // bodyRegion is what retrieval keys on, and it is spread in from the
+        // local parse. When the parser found no region and the model supplies
+        // one, it has to be resolved to a catalog region too — otherwise the
+        // facts card displayed the model's anatomy ("MRI · ריאות") while the
+        // code was retrieved with no anatomy at all, giving MRI of brain.
+        bodyRegion: baseAnalysis.procedure.bodyRegion
+          || resolveBodyRegion(ai.procedure?.anatomicalSite)
+          || null,
         performed: baseAnalysis.procedure.performed || ai.procedure?.performed === true,
         contrast: baseAnalysis.procedure.contrast !== 'לא תועד'
           ? baseAnalysis.procedure.contrast
@@ -632,7 +1144,13 @@ DOCUMENT:
         ...baseAnalysis.findings,
         ...(Array.isArray(ai.findings) ? ai.findings : [])
           .filter((item) => item?.label && item?.evidence)
-          .filter((item) => !baseAnalysis.findings.some((known) => known.label === item.label || known.evidence === item.evidence))
+          // The model paraphrases: it reported "כבד מוגדל (הפטומגליה)" for the
+          // sentence the local parser had already captured as "הגדלת כבד", and
+          // exact-label matching let both through as separate findings — which
+          // would be billed as two diagnoses for one observation. Comparing the
+          // evidence sentences catches the duplicate whatever the wording.
+          .filter((item) => !baseAnalysis.findings.some((known) => known.label === item.label
+            || sameSentence(known.evidence, item.evidence)))
           .map((item, index) => ({
             key: `ai_${index}`,
             label: item.label,
@@ -648,7 +1166,7 @@ DOCUMENT:
     const updatedTerminology = procedureTerminology(merge.procedure);
     merge.terminology = {
       procedure: updatedTerminology,
-      findings: findingTerminology(merge.findings),
+      findings: findingTerminology(merge.findings, merge.procedure.bodyRegion),
     };
     merge.billing = buildBilling(merge.procedure, updatedTerminology);
     merge.confidence = calculateConfidence({
@@ -677,7 +1195,7 @@ function buildLocalAnalysis(text, filename) {
   const procedureCodes = procedureTerminology(procedure);
   const terminology = {
     procedure: procedureCodes,
-    findings: findingTerminology(findings),
+    findings: findingTerminology(findings, procedure.bodyRegion),
   };
   const billing = buildBilling(procedure, procedureCodes);
   const warnings = [
@@ -903,6 +1421,8 @@ export {
   detectDocument,
   detectFindings,
   procedureTerminology,
+  findingTerminology,
+  sameSentence,
   buildLocalAnalysis,
   getAiConfig,
   bedrockConverseUrl,
