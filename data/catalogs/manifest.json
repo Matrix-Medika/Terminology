@@ -1,0 +1,20 @@
+{
+  "edition": "ICD-9-CM FY2012 (effective 2011-10-01), NCHS/CMS Sixth Edition",
+  "source": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD9-CM/2011",
+  "licence": "US federal government publication (NCHS/CMS) — free to redistribute",
+  "builtAt": "2026-08-09T21:38:24.973Z",
+  "files": [
+    {
+      "file": "icd9-procedures.json",
+      "kind": "procedure",
+      "entries": 4491,
+      "sha256": "838cf3690185c4d7bca1bd85e018be60f25e934c47afab967159080fc9b3e879"
+    },
+    {
+      "file": "icd9-diagnoses.json",
+      "kind": "diagnosis",
+      "entries": 16343,
+      "sha256": "b8c7bdedba56dcc72dc97ac2e89a293cab4d3c1be75d8e4f674f8311f239d2bf"
+    }
+  ]
+}
