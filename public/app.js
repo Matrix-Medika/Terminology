@@ -67,22 +67,6 @@ function formatConfidence(value) {
   return Number.isFinite(numeric) ? `${Math.round(numeric)}%` : '—';
 }
 
-function statusClass(status) {
-  if (status === 'matched') return 'matched';
-  if (status === 'candidate' || status === 'needs_review') return 'candidate';
-  return '';
-}
-
-function statusText(status) {
-  const map = {
-    matched: 'מותאם',
-    candidate: 'מועמד',
-    needs_review: 'דורש בדיקה',
-    not_applicable: 'לא חל',
-  };
-  return map[status] || status || '—';
-}
-
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -145,56 +129,73 @@ function renderFindings(analysis) {
     : '<div class="subtle-text">לא חולצו ממצאים קליניים מהמסמך.</div>';
 }
 
-function normalizeConfidence(value, fallback = 82) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return fallback;
-  return Math.round(numeric <= 1 ? numeric * 100 : numeric);
+function makeCandidate(code, display, match, system, context = null, partial = false) {
+  return { code, display, match, system, context, partial };
 }
 
-function makeCandidate(code, display, confidence, system) {
-  return { code, display, confidence, system };
+/**
+ * Builds the selection state from the catalog candidates the server returned.
+ *
+ * Every code shown here comes from the retrieved candidate list. This function
+ * used to fall back to hardcoded ICD-10 and CPT codes when the server returned
+ * nothing — codes that were never in any catalog and did not describe the
+ * document on screen. An empty list is the honest rendering of "the catalog had
+ * no match", and it is what a coder needs to see in order to intervene.
+ */
+/**
+ * Describes how clearly the leading candidate beat the runner-up.
+ *
+ * The match percentage is normalised against the best hit, so the selected code
+ * is always 100% — printing that on every row reads as certainty while carrying
+ * no information. The gap to the second candidate does carry information: a
+ * runner-up scoring 28 means the wording pointed decisively at one code, while
+ * one scoring 97 means two codes fit almost equally and the coder is the only
+ * one who can separate them. That is the signal worth showing.
+ */
+function describeSeparation(alternatives) {
+  const runnerUp = Number(alternatives[0]?.match);
+  if (!Number.isFinite(runnerUp)) return { label: 'ניסוח מובהק', tone: 'clear' };
+  if (runnerUp <= 40) return { label: 'ניסוח מובהק', tone: 'clear' };
+  if (runnerUp <= 75) return { label: 'יש חלופה קרובה', tone: 'review' };
+  return { label: 'חלופות שקולות', tone: 'ambiguous' };
+}
+
+function toSelectionItems(entries, type) {
+  return entries.map((entry, index) => {
+    const alternatives = (entry.candidates || [])
+      .filter((candidate) => candidate.code !== entry.code)
+      .slice(0, 5)
+      .map((candidate) => makeCandidate(
+        candidate.code, candidate.display, candidate.match, entry.system, candidate.context, candidate.partial === true,
+      ));
+    // The selected code's own match against the catalog, not a default. It used
+    // to fall back to 100 when the list was empty, which printed a full progress
+    // bar and a certainty the server had never asserted.
+    const selected = (entry.candidates || []).find((candidate) => candidate.code === entry.code);
+    return {
+      id: `${type}-${index}`,
+      type,
+      included: true,
+      ...makeCandidate(
+        entry.code, entry.display, selected?.match ?? null, entry.system, entry.label, selected?.partial === true,
+      ),
+      separation: describeSeparation(alternatives),
+      alternatives,
+    };
+  });
 }
 
 function initializeCodingState(analysis) {
   const mappings = Array.isArray(analysis.terminology?.findings) ? analysis.terminology.findings : [];
-  const fallbackDiagnoses = [
-    makeCandidate('M54.12', 'רדיקולופתיה צווארית', 88, 'ICD'),
-    makeCandidate('M50.20', 'הפרעת דיסק צווארי', 82, 'ICD'),
-    makeCandidate('M48.02', 'היצרות תעלת השדרה הצווארית', 78, 'ICD'),
-  ];
-  const diagnosisPool = mappings.flatMap((mapping) => [mapping.icd9, mapping.snomed]
-    .filter((code) => code?.code)
-    .map((code) => makeCandidate(code.code, code.display || mapping.label, normalizeConfidence(code.confidence), code.system || 'ICD')));
-  const uniqueDiagnoses = [...diagnosisPool, ...fallbackDiagnoses]
-    .filter((item, index, all) => all.findIndex((candidate) => candidate.code === item.code) === index);
-  state.coding.diagnoses = (mappings.length ? mappings : analysis.findings || []).slice(0, 5).map((mapping, index) => {
-    const primary = uniqueDiagnoses[index] || fallbackDiagnoses[index % fallbackDiagnoses.length];
-    return {
-      id: `diagnosis-${index}`,
-      type: 'diagnosis',
-      included: true,
-      ...primary,
-      alternatives: uniqueDiagnoses.filter((candidate) => candidate.code !== primary.code).slice(0, 3),
-    };
-  });
-  if (!state.coding.diagnoses.length) {
-    state.coding.diagnoses = fallbackDiagnoses.slice(0, 2).map((item, index) => ({ id: `diagnosis-${index}`, type: 'diagnosis', included: false, ...item, alternatives: fallbackDiagnoses.filter((candidate) => candidate.code !== item.code) }));
-  }
+  const diagnosisEntries = mappings
+    .filter((mapping) => mapping.icd9?.code)
+    .map((mapping) => ({ ...mapping.icd9, label: mapping.label }));
+  state.coding.diagnoses = toSelectionItems(diagnosisEntries, 'diagnosis');
 
-  const procedure = analysis.terminology?.procedure || {};
-  const extractedProcedures = [procedure.billing, procedure.icd9, procedure.snomed].filter((code) => code?.code);
-  const procedureAlternatives = [
-    makeCandidate('72141', 'MRI עמוד שדרה צווארי ללא חומר ניגוד', 96, 'CPT'),
-    makeCandidate('72142', 'MRI עמוד שדרה צווארי עם חומר ניגוד', 84, 'CPT'),
-    makeCandidate('72156', 'MRI צווארי ללא ועם חומר ניגוד', 76, 'CPT'),
-  ];
-  state.coding.procedures = extractedProcedures.slice(0, 3).map((code, index) => {
-    const primary = makeCandidate(code.code, code.display || 'פרוצדורה שזוהתה', normalizeConfidence(code.confidence, 90 - index * 5), code.system || 'קוד פרוצדורה');
-    const candidates = [...procedureAlternatives, ...extractedProcedures.map((item) => makeCandidate(item.code, item.display, normalizeConfidence(item.confidence), item.system))]
-      .filter((item, itemIndex, all) => item.code !== primary.code && all.findIndex((candidate) => candidate.code === item.code) === itemIndex)
-      .slice(0, 3);
-    return { id: `procedure-${index}`, type: 'procedure', included: true, ...primary, alternatives: candidates };
-  });
+  const procedure = analysis.terminology?.procedure?.icd9;
+  state.coding.procedures = procedure?.code
+    ? toSelectionItems([procedure], 'procedure')
+    : [];
 }
 
 function renderSelectionItem(item) {
@@ -207,14 +208,19 @@ function renderSelectionItem(item) {
       <b>${escapeHtml(item.code)}</b><span>⌄</span>
       <small>לחיצה להצגת חלופות</small>
     </button>
-    <div class="selection-description"><strong>${escapeHtml(item.display || 'ללא תיאור')}</strong><span>${escapeHtml(item.system || 'מערכת לא ידועה')}</span></div>
-    <div class="match-score"><strong>${formatConfidence(item.confidence)}</strong><span>התאמה</span></div>
+    <div class="selection-description"><strong>${escapeHtml(item.display || 'ללא תיאור')}</strong><span>${escapeHtml(item.context || item.system || '')}</span></div>
+    <div class="match-score is-${escapeHtml(item.separation?.tone || 'clear')}"><strong>${escapeHtml(item.separation?.label || '—')}</strong><span>${item.alternatives.length} חלופות</span></div>
   </article>`;
 }
 
 function renderCodingWorkspace() {
-  $('diagnosisCodes').innerHTML = state.coding.diagnoses.map(renderSelectionItem).join('');
-  $('procedureCodes').innerHTML = state.coding.procedures.map(renderSelectionItem).join('');
+  const empty = (message) => `<div class="subtle-text">${message}</div>`;
+  $('diagnosisCodes').innerHTML = state.coding.diagnoses.length
+    ? state.coding.diagnoses.map(renderSelectionItem).join('')
+    : empty('לא נמצאו קודי אבחנה בקטלוג עבור הממצאים שחולצו.');
+  $('procedureCodes').innerHTML = state.coding.procedures.length
+    ? state.coding.procedures.map(renderSelectionItem).join('')
+    : empty('לא הוצע קוד פרוצדורה — ראו את הפירוט בסעיף הטכני.');
   const diagnosisCount = state.coding.diagnoses.filter((item) => item.included).length;
   const procedureCount = state.coding.procedures.filter((item) => item.included).length;
   $('diagnosisCount').textContent = `${diagnosisCount} נבחרו`;
@@ -228,15 +234,17 @@ function findCodingItem(id) {
 function openAlternatives(item) {
   const popover = $('alternativePopover');
   const title = item.type === 'diagnosis' ? 'חלופות לקוד אבחנה' : 'חלופות לקוד פרוצדורה';
-  const candidates = [makeCandidate(item.code, item.display, item.confidence, item.system), ...item.alternatives];
+  const candidates = [makeCandidate(item.code, item.display, item.match, item.system, item.context), ...item.alternatives];
   popover.innerHTML = `<div class="alternative-head"><div><span>בחירה תשנה את החישוב</span><h3 id="alternativeTitle">${title}</h3></div><button type="button" data-close-alternatives aria-label="סגירה">×</button></div>
     <div class="alternative-list">${candidates.map((candidate) => `<button class="alternative-row ${candidate.code === item.code ? 'current' : ''}" type="button" data-select-alternative="${escapeHtml(item.id)}" data-code="${escapeHtml(candidate.code)}">
       <span class="alternative-code">${escapeHtml(candidate.code)}</span>
-      <span class="alternative-description">${escapeHtml(candidate.display || 'ללא תיאור')}<small>${escapeHtml(candidate.system || '')}</small></span>
-      <span class="alternative-confidence"><b>${formatConfidence(candidate.confidence)}</b><progress max="100" value="${Math.min(100, Number(candidate.confidence) || 0)}" aria-label="אחוז התאמה"></progress></span>
+      <span class="alternative-description">${escapeHtml(candidate.display || 'ללא תיאור')}<small>${escapeHtml(candidate.context || candidate.system || '')}</small></span>
+      <span class="alternative-match">${candidate.partial
+        ? '<b class="is-partial">התאמה חלקית</b><small>לא תואם את כל מאפייני הבדיקה</small>'
+        : `<b>${formatConfidence(candidate.match)}</b><progress max="100" value="${Math.min(100, Number(candidate.match) || 0)}" aria-label="אחוז התאמת ניסוח"></progress>`}</span>
       <span class="alternative-action">${candidate.code === item.code ? 'נבחר' : 'בחירה'}</span>
     </button>`).join('')}</div>
-    <p class="alternative-note">חלופות הן תמיכה בהחלטה ודורשות אימות מקצועי לפני אישור לחיוב.</p>`;
+    <p class="alternative-note">האחוז מודד התאמת ניסוח לקטלוג ICD-9 — לא סבירות קלינית. "התאמה חלקית" = הקוד תואם רק חלק ממאפייני הבדיקה. הבחירה דורשת אימות מקודד.</p>`;
   popover.classList.remove('hidden');
 }
 
@@ -244,21 +252,29 @@ function renderBilling(analysis) {
   const billing = analysis.billing || {};
   const diagnoses = state.coding.diagnoses.filter((item) => item.included);
   const procedures = state.coding.procedures.filter((item) => item.included);
-  const isReady = Boolean(diagnoses.length && procedures.length);
+  const selectionMade = Boolean(diagnoses.length && procedures.length);
   const primaryProcedure = procedures[0];
-  const derivedCode = isReady
-    ? (primaryProcedure?.system === 'CPT' ? primaryProcedure.code : (billing.code || primaryProcedure?.code))
-    : null;
-  $('billingStatusBadge').textContent = isReady ? 'תוצאה מחושבת' : 'חסרה בחירה';
-  $('billingStatusBadge').style.color = isReady ? 'var(--success)' : 'var(--amber)';
-  $('billingStatusBadge').style.background = isReady ? 'var(--success-soft)' : 'var(--amber-soft)';
+  // The service code comes from the MoH tariff, which is not loaded, so there is
+  // nothing to derive. Showing the ICD-9 procedure code in its place would be
+  // misleading: ICD-9 classifies what was done, it does not price it.
+  const tariffLoaded = Boolean(billing.code);
+  $('billingStatusBadge').textContent = tariffLoaded
+    ? (selectionMade ? 'תוצאה מחושבת' : 'חסרה בחירה')
+    : 'מחירון לא טעון';
+  const badgeColour = tariffLoaded && selectionMade ? 'success' : 'amber';
+  $('billingStatusBadge').style.color = `var(--${badgeColour})`;
+  $('billingStatusBadge').style.background = `var(--${badgeColour}-soft)`;
 
   $('billingCard').innerHTML = `
     <div class="billing-main">
-      <div class="billing-label">קוד חיוב שנגזר מהבחירה</div>
-      <div class="billing-code">${escapeHtml(derivedCode || '—')}</div>
-      <div class="billing-display">${escapeHtml(isReady ? (primaryProcedure?.display || billing.display || 'קוד שירות מוצע') : 'יש לבחור לפחות אבחנה ופרוצדורה אחת')}</div>
-      <span class="live-calculation">● עודכן כעת</span>
+      <div class="billing-label">${escapeHtml(tariffLoaded ? 'קוד חיוב שנגזר מהבחירה' : 'קוד חיוב')}</div>
+      <div class="billing-code">${escapeHtml(billing.code || '—')}</div>
+      <div class="billing-display">${escapeHtml(tariffLoaded
+        ? (selectionMade ? (billing.display || 'קוד שירות מוצע') : 'יש לבחור לפחות אבחנה ופרוצדורה אחת')
+        : (billing.display || 'מחירון משרד הבריאות אינו טעון — לא ניתן להפיק קוד חיוב'))}</div>
+      <div class="billing-display">${escapeHtml(primaryProcedure
+        ? `קוד פרוצדורה נבחר: ${primaryProcedure.code} (ICD-9-CM, לתיעוד — לא לתמחור)`
+        : 'לא נבחר קוד פרוצדורה')}</div>
     </div>
     <div class="billing-dependency">
       <span class="dependency-label">מושפע מ־</span>
@@ -560,17 +576,18 @@ document.addEventListener('click', (event) => {
   const alternativeChoice = event.target.closest('[data-select-alternative]');
   if (alternativeChoice) {
     const item = findCodingItem(alternativeChoice.dataset.selectAlternative);
-    const candidate = item ? [makeCandidate(item.code, item.display, item.confidence, item.system), ...item.alternatives]
+    const candidate = item ? [makeCandidate(item.code, item.display, item.match, item.system, item.context), ...item.alternatives]
       .find((option) => option.code === alternativeChoice.dataset.code) : null;
     if (item && candidate) {
-      const previous = makeCandidate(item.code, item.display, item.confidence, item.system);
+      const previous = makeCandidate(item.code, item.display, item.match, item.system, item.context);
       item.code = candidate.code;
       item.display = candidate.display;
-      item.confidence = candidate.confidence;
+      item.match = candidate.match;
       item.system = candidate.system;
+      item.context = candidate.context;
       item.alternatives = [previous, ...item.alternatives.filter((option) => option.code !== candidate.code)]
         .filter((option, index, all) => all.findIndex((entry) => entry.code === option.code) === index)
-        .slice(0, 3);
+        .slice(0, 5);
       $('alternativePopover').classList.add('hidden');
       recalculateBilling(`הקוד הוחלף ל־${candidate.code} · החיוב עודכן`);
     }
