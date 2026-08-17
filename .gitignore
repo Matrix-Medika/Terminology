@@ -34,3 +34,25 @@ medical-documents/
 *.docx
 *.nii
 *.nii.gz
+
+# Rendered document pages and spreadsheets.
+#
+# This working folder accumulates output from unrelated tasks — page renders of
+# internal documents, timesheets, scratch build scripts. None of it belongs in
+# the repository, and the existing rules did not stop it: .pdf was blocked but
+# .png renders of the same pages were not, and .xlsx was not blocked at all. A
+# single "git add ." would have published an employee's hours into a repo that
+# outside developers now have access to.
+#
+# No .png or .xlsx is tracked, so these patterns cost the project nothing. Use
+# "git add -f" for a file that genuinely belongs here, such as a UI asset.
+*.png
+*.jpg
+*.jpeg
+*.xlsx
+*.xls
+__pycache__/
+*.pyc
+work/
+qa_*/
+build_part11_*.py
